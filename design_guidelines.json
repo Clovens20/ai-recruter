@@ -1,0 +1,77 @@
+{
+  "project_name": "Konekte AI Recruiter Agent",
+  "domain": "SaaS Dashboard / AI Recruiting",
+  "theme": "dark",
+  "archetype": "Archetype 4 (Swiss & High-Contrast - Dark variant)",
+  "design_philosophy": "A 'Control Room' for AI recruiting. Dense, functional, scanning-optimized. Uses 'couleur AI intelligent' with deep obsidian blacks, crisp pure whites, and electric true blue accents. Avoids generic purple/teal. High contrast signals authority and precision.",
+  "colors": {
+    "background": "#050505",
+    "surface": "#0F0F0F",
+    "surface_hover": "#1A1A1A",
+    "border": "rgba(255, 255, 255, 0.08)",
+    "primary": "#2563EB",
+    "primary_hover": "#1D4ED8",
+    "text_main": "#F8FAFC",
+    "text_muted": "#94A3B8",
+    "ai_accent": "#00E5FF",
+    "score_high": "#10B981",
+    "score_medium": "#F59E0B",
+    "score_low": "#EF4444",
+    "platform_youtube": "#FF0000",
+    "platform_tiktok": "#00F2FE",
+    "platform_facebook": "#1877F2"
+  },
+  "typography": {
+    "heading_font": "Outfit",
+    "body_font": "IBM Plex Sans",
+    "hierarchy": {
+      "h1": "text-4xl sm:text-5xl font-black tracking-tighter text-white",
+      "h2": "text-2xl sm:text-3xl font-bold tracking-tight text-white",
+      "h3": "text-xl sm:text-2xl font-semibold tracking-tight text-white",
+      "h4": "text-lg font-medium tracking-tight text-white",
+      "body": "text-base font-normal leading-relaxed text-[#94A3B8]",
+      "small_label": "text-xs font-semibold tracking-[0.1em] uppercase text-[#94A3B8]"
+    }
+  },
+  "layout_and_spacing": {
+    "grid_system": "Control Room Grid (Dense, gap-4 to gap-6). Left sidebar (w-64) + main content area. Strict grid hierarchy for dashboard widgets.",
+    "container_padding": "Generous internal padding for cards (p-6 or p-8) to prevent text collision with borders.",
+    "surface_treatment": "Flat solid surfaces. 1px solid border (#ffffff14). No heavy shadows by default, use shadow-lg only on hover or active states. Avoid Glassmorphism on data-heavy tables, use it only for sticky headers."
+  },
+  "components_instructions": {
+    "sidebar": "Fixed on the left. Darkest background (#050505). Clear active states for nav items (bg-white/10).",
+    "top_header": "Sticky with backdrop-blur-xl and bg-background/80. 1px bottom border. Contains breadcrumbs and global 'Generate Message' quick action.",
+    "leads_table": "Use Shadcn Table. Dense padding. Columns: Lead (Avatar + Name), Platform (Icon), Status (Badge), Domain, AI Score (Visual bar/circle), Actions. Hover rows to slightly lighten background.",
+    "ai_score_badge": "Render as a combination of a small progress ring and text. Color maps to score thresholds: Green (>80), Amber (50-79), Red (<50).",
+    "status_badge": "Rounded-full px-2 py-1 text-xs font-medium. Use subtle background tints (e.g., bg-blue-500/10 text-blue-400 for 'New', bg-green-500/10 text-green-400 for 'Replied').",
+    "profile_analysis_form": "Use Shadcn Form components (Input, Select, Textarea) inside a flat Card. Keep labels small and uppercase (tracking-wide). Input backgrounds should be darker than the card surface.",
+    "generate_message_button": "The primary 'AI intelligent' action. Use the primary color (#2563EB). Add an icon (e.g., Lucide Sparkles). Consider a subtle inner glow or 'Tracing Beam' effect.",
+    "platform_icons": "Use react-icons (FaFacebook, FaTiktok, FaYoutube) colored with their respective brand colors when active."
+  },
+  "motion_interactions": {
+    "hover": "Interactive elements must transition cleanly (duration-200). Explicitly define text color on hover.",
+    "page_load": "Use Framer Motion to stagger the entrance of dashboard widgets and table rows (y: 10, opacity: 0 -> 1).",
+    "modals": "Message generation results should appear in a Shadcn Dialog. Animate the generation typing effect if possible."
+  },
+  "media_urls": {
+    "lead_avatars": [
+      "https://images.unsplash.com/photo-1573497019940-1c28c88b4f3e",
+      "https://images.unsplash.com/photo-1560250097-0b93528c311a",
+      "https://images.unsplash.com/photo-1652471943570-f3590a4e52ed",
+      "https://images.unsplash.com/photo-1629425733761-caae3b5f2e50",
+      "https://images.unsplash.com/photo-1568602471122-7832951cc4c5",
+      "https://images.unsplash.com/photo-1574281570877-bd815ebb50a4"
+    ],
+    "abstract_backgrounds": [
+      "https://images.unsplash.com/photo-1762279389042-9439bfb6c155"
+    ]
+  },
+  "technical_requirements_for_main_agent": [
+    "Install required packages: yarn add framer-motion lucide-react react-icons recharts clsx tailwind-merge",
+    "Use ONLY pure HTML + Tailwind for structural layouts, and Shadcn UI heavily customized for interactive components (Table, Dialog, Form, Select, DropdownMenu).",
+    "CRITICAL: Include `data-testid` on ALL interactive elements (buttons, inputs, dropdowns, table rows) using kebab-case role-based names.",
+    "Ensure color contrast meets APCA/WCAG standards. Text on dark background must be #F8FAFC or #A1A1AA.",
+    "Do NOT use HTML <select> or <input type='date'>. Use Shadcn DropdownMenu/Select and Calendar.",
+    "Avoid generic 'Inter' for headings. Configure 'Outfit' in Tailwind as the sans family for headings, and 'IBM Plex Sans' for body."
+  ]
+}
