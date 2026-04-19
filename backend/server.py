@@ -1,8 +1,8 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, Depends, status
+from fastapi import BackgroundTasks, FastAPI, APIRouter, HTTPException, Query, Depends, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import asyncio
 import logging
@@ -86,6 +86,63 @@ OFFLINE_LEADS: List[Dict[str, Any]] = []
 OFFLINE_AGENT_CONFIGS: List[Dict[str, Any]] = []
 OFFLINE_AGENT_RUNS: List[Dict[str, Any]] = []
 
+# Agents kreye an lokall (fallback) — persist apre restart serveur
+OFFLINE_AGENTS_JSON = ROOT_DIR / ".offline_agents.json"
+
+
+def _load_offline_agent_configs_from_disk() -> None:
+    if not OFFLINE_AGENTS_JSON.is_file():
+        return
+    try:
+        raw = OFFLINE_AGENTS_JSON.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            OFFLINE_AGENT_CONFIGS.clear()
+            OFFLINE_AGENT_CONFIGS.extend(data)
+            logger.info("Chaje %s agent(s) depi %s", len(OFFLINE_AGENT_CONFIGS), OFFLINE_AGENTS_JSON.name)
+    except Exception as e:
+        logger.warning("Pa ka chaje %s: %s", OFFLINE_AGENTS_JSON, e)
+
+
+def _persist_offline_agent_configs() -> None:
+    try:
+        OFFLINE_AGENTS_JSON.write_text(
+            json.dumps(OFFLINE_AGENT_CONFIGS, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning("Pa ka anrejistre agents offline: %s", e)
+
+
+def _prune_offline_agents_that_exist_remotely(remote_rows: List[Dict[str, Any]]) -> None:
+    """Si Supabase retounen yon agent, retire kopi stale nan fichye offline (menm id)."""
+    if not remote_rows:
+        return
+    rids = {str(r.get("id")) for r in remote_rows if r.get("id")}
+    before = len(OFFLINE_AGENT_CONFIGS)
+    OFFLINE_AGENT_CONFIGS[:] = [c for c in OFFLINE_AGENT_CONFIGS if str(c.get("id")) not in rids]
+    if len(OFFLINE_AGENT_CONFIGS) < before:
+        _persist_offline_agent_configs()
+
+
+def _merge_remote_and_offline_agent_configs(remote: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Si Supabase reponn [] (tab vid), pa pèdi agents ki te kreye an offline.
+    Konbine remote + offline (pa id), tri pa created_at desc.
+    """
+    remote_list: List[Dict[str, Any]] = [] if remote is None else list(remote)
+    remote_ids = {str(r.get("id")) for r in remote_list if r.get("id")}
+    merged = list(remote_list)
+    for c in OFFLINE_AGENT_CONFIGS:
+        cid = str(c.get("id", ""))
+        if cid and cid not in remote_ids:
+            merged.append(c)
+    merged.sort(key=lambda x: str(x.get("created_at") or x.get("updated_at") or ""), reverse=True)
+    return merged
+
+
+_load_offline_agent_configs_from_disk()
+
 
 def _is_transient_supabase_failure(exc: BaseException) -> bool:
     if isinstance(exc, (requests.Timeout, requests.ConnectionError, OSError)):
@@ -101,11 +158,50 @@ def _is_transient_supabase_failure(exc: BaseException) -> bool:
     return False
 
 
+def _agent_supabase_timeout() -> float:
+    """Timeout kout pou agent_configs / agent_runs (kreyasyon rapid, pa 45s bloke)."""
+    return max(4.0, min(60.0, float(os.environ.get("SUPABASE_AGENT_HTTP_TIMEOUT", "6"))))
+
+
+# Kreyasyon agent: repons imedyat an lokal, senkronizasyon Supabase an aryè (pi rapid pou UI)
+AGENT_CREATE_OFFLINE_FIRST = os.environ.get("AGENT_CREATE_OFFLINE_FIRST", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _sync_agent_create_to_supabase(agent_id: str, payload: Dict[str, Any]) -> None:
+    """Apre kreyasyon rapid offline, eseye INSERT nan Supabase ak menm UUID."""
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return
+    try:
+        ensure_supabase_config()
+        body = {**payload, "id": agent_id}
+        rows = supabase_request(
+            "POST",
+            "/agent_configs",
+            payload=body,
+            request_timeout=float(os.environ.get("SUPABASE_HTTP_TIMEOUT", "30")),
+        )
+        if not rows:
+            return
+        server_row = rows[0]
+        for i, c in enumerate(OFFLINE_AGENT_CONFIGS):
+            if str(c.get("id")) == str(agent_id):
+                OFFLINE_AGENT_CONFIGS[i] = server_row
+                _persist_offline_agent_configs()
+                return
+    except Exception as e:
+        logger.warning("Sync agent → Supabase (agent rete lokal): %s", e)
+
+
 def _supabase_try_call(
     method: str,
     path: str,
     params: Optional[dict] = None,
     payload: Optional[dict] = None,
+    request_timeout: Optional[float] = None,
 ) -> Optional[List[Any]]:
     """
     Retounen list JSON si siksè, None si non konfigire oswa erè transitoire.
@@ -114,7 +210,9 @@ def _supabase_try_call(
     if not SUPABASE_URL or not SUPABASE_KEY:
         return None
     try:
-        return supabase_request(method, path, params=params, payload=payload) or []
+        return supabase_request(
+            method, path, params=params, payload=payload, request_timeout=request_timeout
+        ) or []
     except HTTPException as e:
         if _is_transient_supabase_failure(e):
             logger.warning("Supabase indisponible (transitoire), fallback memoire: %s", e.detail)
@@ -125,8 +223,10 @@ def _supabase_try_call(
         return None
 
 
-def _supabase_try_list(method: str, path: str, params: Optional[dict] = None) -> Optional[List[Any]]:
-    return _supabase_try_call(method, path, params=params, payload=None)
+def _supabase_try_list(
+    method: str, path: str, params: Optional[dict] = None, request_timeout: Optional[float] = None
+) -> Optional[List[Any]]:
+    return _supabase_try_call(method, path, params=params, payload=None, request_timeout=request_timeout)
 
 
 def _filter_leads_local(
@@ -200,7 +300,13 @@ def ensure_supabase_config():
         )
 
 
-def supabase_request(method: str, path: str, params: Optional[dict] = None, payload: Optional[dict] = None):
+def supabase_request(
+    method: str,
+    path: str,
+    params: Optional[dict] = None,
+    payload: Optional[dict] = None,
+    request_timeout: Optional[float] = None,
+):
     ensure_supabase_config()
     headers = {
         "apikey": SUPABASE_KEY,
@@ -209,10 +315,17 @@ def supabase_request(method: str, path: str, params: Optional[dict] = None, payl
         "Prefer": "return=representation",
     }
     url = f"{SUPABASE_REST_URL}{path}"
-    max_attempts = max(2, min(12, int(os.environ.get("SUPABASE_MAX_ATTEMPTS", "8"))))
+    max_attempts = max(2, min(12, int(os.environ.get("SUPABASE_MAX_ATTEMPTS", "3"))))
+    timeout_sec = (
+        float(request_timeout)
+        if request_timeout is not None
+        else float(os.environ.get("SUPABASE_HTTP_TIMEOUT", "45"))
+    )
 
     for attempt in range(1, max_attempts + 1):
-        response = requests.request(method, url, headers=headers, params=params, json=payload, timeout=45)
+        response = requests.request(
+            method, url, headers=headers, params=params, json=payload, timeout=timeout_sec
+        )
         body_text = response.text or ""
 
         if response.status_code < 400:
@@ -225,7 +338,9 @@ def supabase_request(method: str, path: str, params: Optional[dict] = None, payl
             "pgrst002" in body_lower
             or "schema cache" in body_lower
         )
-        if is_schema_cache_retryable and attempt < max_attempts:
+        # Plan Free / PGRST002: les longues boucles bloquent tout le dev. Re-essayer seulement si explicitement demande.
+        retry_pgrst = os.environ.get("SUPABASE_PGRST002_RETRY", "0").lower() in ("1", "true", "yes")
+        if is_schema_cache_retryable and attempt < max_attempts and retry_pgrst:
             sleep_s = min(45.0, 2.0 ** (attempt - 1))
             logger.warning(
                 "Supabase schema cache indisponible (tentative %s/%s). Nouvelle tentative dans %.1fs...",
@@ -372,12 +487,53 @@ def _stats_from_leads_rows(all_leads: List[Dict[str, Any]]) -> StatsResponse:
 
 def _offline_append_agent_row(row: Dict[str, Any]) -> Dict[str, Any]:
     OFFLINE_AGENT_CONFIGS.insert(0, row)
+    _persist_offline_agent_configs()
     return row
+
+
+def _offline_remove_agent_by_id(agent_id: str) -> bool:
+    aid = str(agent_id)
+    before = len(OFFLINE_AGENT_CONFIGS)
+    OFFLINE_AGENT_CONFIGS[:] = [c for c in OFFLINE_AGENT_CONFIGS if str(c.get("id")) != aid]
+    if len(OFFLINE_AGENT_CONFIGS) < before:
+        _persist_offline_agent_configs()
+        return True
+    return False
 
 
 def _offline_append_lead_row(row: Dict[str, Any]) -> Dict[str, Any]:
     OFFLINE_LEADS.insert(0, row)
     return row
+
+
+def _offline_insert_agent_run(row: Dict[str, Any]) -> str:
+    rid = str(row.get("id") or uuid4())
+    OFFLINE_AGENT_RUNS.insert(0, {**row, "id": rid})
+    return rid
+
+
+def _offline_merge_agent_run(run_id: str, updates: Dict[str, Any]) -> None:
+    uid = str(run_id)
+    for i, row in enumerate(OFFLINE_AGENT_RUNS):
+        if str(row.get("id")) == uid:
+            OFFLINE_AGENT_RUNS[i] = {**row, **updates}
+            return
+    OFFLINE_AGENT_RUNS.insert(0, {"id": uid, **updates})
+
+
+def _get_agent_config(agent_id: str) -> Optional[Dict[str, Any]]:
+    rows = _supabase_try_list(
+        "GET",
+        "/agent_configs",
+        params={"id": f"eq.{agent_id}", "select": "*", "limit": "1"},
+        request_timeout=_agent_supabase_timeout(),
+    )
+    if rows:
+        return rows[0]
+    for c in OFFLINE_AGENT_CONFIGS:
+        if str(c.get("id")) == str(agent_id):
+            return c
+    return None
 
 
 class LoginRequest(BaseModel):
@@ -917,7 +1073,7 @@ async def upsert_discovered_profiles(profiles: List[dict], dry_run: bool) -> int
             discovered_count += 1
             continue
 
-        existing = supabase_request(
+        existing = _supabase_try_list(
             "GET",
             "/leads",
             params={
@@ -927,7 +1083,14 @@ async def upsert_discovered_profiles(profiles: List[dict], dry_run: bool) -> int
                 "limit": "1",
             },
         )
-        if existing:
+        if existing is None:
+            if any(
+                (l.get("name") or "").strip() == (profile.get("name") or "").strip()
+                and str(l.get("platform") or "").lower() == str(profile.get("platform") or "").lower()
+                for l in OFFLINE_LEADS
+            ):
+                continue
+        elif existing:
             continue
 
         profile_input = ProfileInput(
@@ -954,10 +1117,35 @@ async def upsert_discovered_profiles(profiles: List[dict], dry_run: bool) -> int
             "generated_message": "",
             "status": "new",
         }
-        supabase_request("POST", "/leads", payload=lead_doc)
+        inserted = _supabase_try_call("POST", "/leads", payload=lead_doc)
+        if not inserted:
+            _offline_append_lead_row(
+                {"id": str(uuid4()), "created_at": utc_now_iso(), **lead_doc}
+            )
         discovered_count += 1
 
     return discovered_count
+
+
+def _youtube_discovery_rows_to_lead_profiles(rows: List[Dict[str, Any]]) -> List[dict]:
+    """Alinye sorti agent_recruiter (YouTube) ak `upsert_discovered_profiles`."""
+    out: List[dict] = []
+    for r in rows or []:
+        bio = (r.get("bio") or "")[:2000]
+        sn = (r.get("snippet") or "")[:500]
+        combined = f"{bio}\n{sn}"
+        name = (r.get("username") or "").strip() or "YouTube"
+        out.append(
+            {
+                "name": name,
+                "bio": bio,
+                "platform": "youtube",
+                "followers": int(r.get("followers") or 0),
+                "content_example": (sn or bio[:200] or "Kontni YouTube.").strip(),
+                "email": agent_rc.extract_email_from_text(combined),
+            }
+        )
+    return out
 
 
 async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
@@ -967,7 +1155,19 @@ async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
     discovered_count = 0
 
     if payload.discover_youtube:
-        youtube_profiles = discover_youtube_channels(max_results=max(1, min(payload.youtube_max_results, 100)))
+        max_yt = max(1, min(payload.youtube_max_results, 100))
+        cat = agent_rc.normalize_category(os.environ.get("AGENT_YOUTUBE_CATEGORY", "Edikasyon").strip() or "Edikasyon")
+        yt_rows = await agent_rc.discover_youtube_channels_category_async(cat, max_yt)
+        youtube_profiles = _youtube_discovery_rows_to_lead_profiles(yt_rows)
+        if not youtube_profiles and not YOUTUBE_API_KEY:
+            logger.warning(
+                "Cycle agent: YOUTUBE_API_KEY manke — 0 pwofil YouTube. Mete kle nan .env epi aktive YouTube Data API v3."
+            )
+        elif not youtube_profiles and YOUTUBE_API_KEY:
+            logger.warning(
+                "Cycle agent: YouTube retounen 0 kanaal (kategori=%s). Verifye quota / erè API nan konsol Google Cloud.",
+                cat,
+            )
         discovered_count = await upsert_discovered_profiles(youtube_profiles, dry_run=payload.dry_run)
 
     params = {
@@ -976,7 +1176,14 @@ async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
         "order": "score.desc",
         "limit": str(max(1, min(payload.max_profiles, 100))),
     }
-    leads = supabase_request("GET", "/leads", params=params)
+    lim = max(1, min(payload.max_profiles, 100))
+    leads_rows = _supabase_try_list("GET", "/leads", params=params)
+    if leads_rows is None:
+        offline_new = [l for l in OFFLINE_LEADS if (l.get("status") or "new") == "new"]
+        offline_new.sort(key=lambda x: int(x.get("score") or 0), reverse=True)
+        leads = offline_new[:lim]
+    else:
+        leads = leads_rows
     scanned = len(leads)
     selected_rows = [
         lead for lead in leads
@@ -994,16 +1201,32 @@ async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
             )
             if sent:
                 emailed += 1
-                supabase_request(
+                patched = _supabase_try_call(
                     "PATCH",
                     "/leads",
                     params={"id": f"eq.{lead['id']}", "select": "*"},
                     payload={"status": "contacted"},
                 )
+                if patched is None:
+                    for l in OFFLINE_LEADS:
+                        if str(l.get("id")) == str(lead.get("id")):
+                            l["status"] = "contacted"
+                            break
+
+    hints: List[str] = []
+    if payload.discover_youtube and discovered_count == 0:
+        hints.append("YouTube: verifye YOUTUBE_API_KEY + API YouTube Data aktive (Google Cloud)")
+    if scanned > 0 and not selected_rows:
+        hints.append(
+            "Seleksyon: sèlman leads ak imel + potential moyen/eleve — anpil chaèn YouTube pa gen imel nan bio"
+        )
+    if not payload.dry_run and scanned > 0 and not selected_rows:
+        hints.append("SMTP: konfigire SMTP_* pou voye imel lè gen lead ki kalifye")
+    hint_txt = (" " + " · ".join(hints)) if hints else ""
 
     summary = (
         f"Run {run_id}: {discovered_count} nouvo pwofil dekouvri, {scanned} pwofil analize, "
-        f"{len(selected_rows)} pwofil seleksyone, {emailed if not payload.dry_run else 0} imel voye."
+        f"{len(selected_rows)} pwofil seleksyone, {emailed if not payload.dry_run else 0} imel voye.{hint_txt}"
     )
     return {
         "run_id": run_id,
@@ -1245,14 +1468,19 @@ async def list_agents(current_user: str = Depends(require_auth)):
         "GET",
         "/agent_configs",
         params={"select": "*", "order": "created_at.desc", "limit": "200"},
+        request_timeout=_agent_supabase_timeout(),
     )
-    if rows is None:
-        return list(OFFLINE_AGENT_CONFIGS)
-    return rows
+    if rows is not None and rows:
+        _prune_offline_agents_that_exist_remotely(rows)
+    return _merge_remote_and_offline_agent_configs(rows)
 
 
 @api_router.post("/agents", response_model=AgentConfigResponse)
-async def create_agent(data: AgentConfigCreateRequest, current_user: str = Depends(require_auth)):
+async def create_agent(
+    data: AgentConfigCreateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: str = Depends(require_auth),
+):
     settings = build_agent_settings_from_request(data)
     payload = {
         "name": data.name.strip(),
@@ -1263,7 +1491,16 @@ async def create_agent(data: AgentConfigCreateRequest, current_user: str = Depen
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
-    rows = _supabase_try_call("POST", "/agent_configs", payload=payload)
+    if AGENT_CREATE_OFFLINE_FIRST:
+        aid = str(uuid4())
+        row = {"id": aid, **payload}
+        saved = _offline_append_agent_row(row)
+        if SUPABASE_URL and SUPABASE_KEY:
+            background_tasks.add_task(_sync_agent_create_to_supabase, aid, dict(payload))
+        return saved
+    rows = _supabase_try_call(
+        "POST", "/agent_configs", payload=payload, request_timeout=_agent_supabase_timeout()
+    )
     if rows:
         return rows[0]
     row = {"id": str(uuid4()), **payload}
@@ -1272,15 +1509,10 @@ async def create_agent(data: AgentConfigCreateRequest, current_user: str = Depen
 
 @api_router.patch("/agents/{agent_id}", response_model=AgentConfigResponse)
 async def update_agent(agent_id: str, data: AgentConfigUpdateRequest, current_user: str = Depends(require_auth)):
-    existing_rows = supabase_request(
-        "GET",
-        "/agent_configs",
-        params={"id": f"eq.{agent_id}", "select": "*", "limit": "1"},
-    )
-    if not existing_rows:
+    existing = _get_agent_config(agent_id)
+    if not existing:
         raise HTTPException(status_code=404, detail="Agent not found.")
 
-    existing = existing_rows[0]
     merged_settings = merge_agent_settings(existing.get("settings", {}) or {}, data)
     update_payload = {"settings": merged_settings, "updated_at": utc_now_iso()}
     if data.name is not None:
@@ -1290,15 +1522,47 @@ async def update_agent(agent_id: str, data: AgentConfigUpdateRequest, current_us
     if data.enabled is not None:
         update_payload["enabled"] = data.enabled
 
-    rows = supabase_request(
+    rows = _supabase_try_call(
         "PATCH",
         "/agent_configs",
         params={"id": f"eq.{agent_id}", "select": "*"},
         payload=update_payload,
+        request_timeout=_agent_supabase_timeout(),
     )
-    if not rows:
-        raise HTTPException(status_code=500, detail="Failed to update agent.")
-    return rows[0]
+    if rows:
+        _offline_remove_agent_by_id(agent_id)
+        return rows[0]
+    for i, c in enumerate(OFFLINE_AGENT_CONFIGS):
+        if str(c.get("id")) == str(agent_id):
+            updated = {**c, **update_payload}
+            OFFLINE_AGENT_CONFIGS[i] = updated
+            _persist_offline_agent_configs()
+            return updated
+    raise HTTPException(status_code=500, detail="Failed to update agent.")
+
+
+@api_router.delete("/agents/{agent_id}")
+async def delete_agent(agent_id: str, current_user: str = Depends(require_auth)):
+    """Siprime agent: Supabase si posib, epi fichye offline."""
+    cfg = _get_agent_config(agent_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    had_offline = _offline_remove_agent_by_id(agent_id)
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            supabase_request(
+                "DELETE",
+                "/agent_configs",
+                params={"id": f"eq.{agent_id}", "select": "*"},
+                request_timeout=_agent_supabase_timeout(),
+            )
+        except HTTPException as e:
+            if _is_transient_supabase_failure(e) or e.status_code >= 500:
+                raise
+            if not had_offline:
+                raise
+            logger.info("DELETE agent Supabase (optional, agent te offline): %s", e.detail)
+    return {"message": "Agent deleted.", "id": agent_id}
 
 
 @api_router.get("/agents/runs", response_model=List[AgentRunRecordResponse])
@@ -1307,6 +1571,7 @@ async def list_agent_runs(current_user: str = Depends(require_auth)):
         "GET",
         "/agent_runs",
         params={"select": "*", "order": "started_at.desc", "limit": "300"},
+        request_timeout=_agent_supabase_timeout(),
     )
     source = rows if rows is not None else OFFLINE_AGENT_RUNS
     normalized = []
@@ -1317,14 +1582,9 @@ async def list_agent_runs(current_user: str = Depends(require_auth)):
 
 @api_router.post("/agents/{agent_id}/run", response_model=AgentRunResponse)
 async def run_named_agent(agent_id: str, current_user: str = Depends(require_auth)):
-    config_rows = supabase_request(
-        "GET",
-        "/agent_configs",
-        params={"id": f"eq.{agent_id}", "select": "*", "limit": "1"},
-    )
-    if not config_rows:
+    config = _get_agent_config(agent_id)
+    if not config:
         raise HTTPException(status_code=404, detail="Agent not found.")
-    config = config_rows[0]
     if not config.get("enabled", True):
         raise HTTPException(status_code=400, detail="Agent is disabled.")
 
@@ -1336,50 +1596,55 @@ async def run_named_agent(agent_id: str, current_user: str = Depends(require_aut
         youtube_max_results=int(settings.get("youtube_max_results", 20)),
     )
 
-    run_record_rows = supabase_request(
-        "POST",
-        "/agent_runs",
-        payload={
-            "agent_id": agent_id,
-            "agent_name": config.get("name", ""),
-            "status": "running",
-            "run_type": config.get("function_type", "recruitment"),
-            "summary": "Agent run started",
-            "details": {},
-            "triggered_by": current_user,
-            "started_at": utc_now_iso(),
-        },
+    run_row = {
+        "agent_id": agent_id,
+        "agent_name": config.get("name", ""),
+        "status": "running",
+        "run_type": config.get("function_type", "recruitment"),
+        "summary": "Agent run started",
+        "details": {},
+        "triggered_by": current_user,
+        "started_at": utc_now_iso(),
+    }
+    run_record_rows = _supabase_try_call(
+        "POST", "/agent_runs", payload=run_row, request_timeout=_agent_supabase_timeout()
     )
-    run_record_id = run_record_rows[0]["id"] if run_record_rows else None
+    if run_record_rows:
+        run_record_id = run_record_rows[0].get("id")
+    else:
+        run_record_id = _offline_insert_agent_run({**run_row, "id": str(uuid4())})
+
+    def patch_run_record(updates: Dict[str, Any]) -> None:
+        patched = _supabase_try_call(
+            "PATCH",
+            "/agent_runs",
+            params={"id": f"eq.{run_record_id}", "select": "*"},
+            payload=updates,
+            request_timeout=_agent_supabase_timeout(),
+        )
+        if patched is None:
+            _offline_merge_agent_run(str(run_record_id), updates)
 
     try:
         result = await execute_agent_cycle(payload)
-        if run_record_id:
-            supabase_request(
-                "PATCH",
-                "/agent_runs",
-                params={"id": f"eq.{run_record_id}", "select": "*"},
-                payload={
-                    "status": "completed",
-                    "summary": result["summary"],
-                    "details": result,
-                    "finished_at": utc_now_iso(),
-                },
-            )
+        patch_run_record(
+            {
+                "status": "completed",
+                "summary": result["summary"],
+                "details": result,
+                "finished_at": utc_now_iso(),
+            }
+        )
         return AgentRunResponse(**result)
     except Exception as e:
-        if run_record_id:
-            supabase_request(
-                "PATCH",
-                "/agent_runs",
-                params={"id": f"eq.{run_record_id}", "select": "*"},
-                payload={
-                    "status": "failed",
-                    "summary": f"Agent failed: {e}",
-                    "details": {"error": str(e)},
-                    "finished_at": utc_now_iso(),
-                },
-            )
+        patch_run_record(
+            {
+                "status": "failed",
+                "summary": f"Agent failed: {e}",
+                "details": {"error": str(e)},
+                "finished_at": utc_now_iso(),
+            }
+        )
         raise
 
 
@@ -1428,7 +1693,7 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
         if "youtube" not in plats:
             return []
         try:
-            rows = await asyncio.to_thread(agent_rc.discover_youtube_channels_category, cat, per)
+            rows = await agent_rc.discover_youtube_channels_category_async(cat, per)
             out = []
             for row in rows or []:
                 out.append(
@@ -1662,8 +1927,12 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "https://agentai.konektegroup.com",
+    ],
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )

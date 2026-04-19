@@ -87,4 +87,5 @@ frontend/node_modules/.cache/default-development/0.pack
 .env.*
 !.env.example
 backend/.env
+backend/.offline_agents.json
 frontend/.env

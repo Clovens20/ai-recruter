@@ -9,8 +9,9 @@ import logging
 import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -19,9 +20,10 @@ logger = logging.getLogger(__name__)
 APIFY_TOKEN = os.environ.get("APIFY_API_KEY", "")
 # Tan maks Apify `call(wait_secs=...)` — pi ba = pi vit, men riske timeout si actor a lan
 APIFY_WAIT_SECS = max(25, min(180, int(os.environ.get("APIFY_WAIT_SECS", "70"))))
-# Mwen hashtags = actor TikTok fini pi vit
-APIFY_TIKTOK_HASHTAG_COUNT = max(1, min(8, int(os.environ.get("APIFY_TIKTOK_HASHTAG_COUNT", "2"))))
-APIFY_TIKTOK_RESULTS_CAP = max(3, min(40, int(os.environ.get("APIFY_TIKTOK_RESULTS_CAP", "12"))))
+# TikTok: anpil hashtags nan yon sèl run Apify (max ~20 selon actor)
+APIFY_TIKTOK_HASHTAGS_MAX = max(6, min(24, int(os.environ.get("APIFY_TIKTOK_HASHTAGS_MAX", "15"))))
+APIFY_TIKTOK_RESULTS_PER_PAGE = max(15, min(100, int(os.environ.get("APIFY_TIKTOK_RESULTS_PER_PAGE", "50"))))
+APIFY_TIKTOK_RESULTS_CAP = max(3, min(100, int(os.environ.get("APIFY_TIKTOK_RESULTS_CAP", "50"))))
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 # YouTube: mwens requetes si fast (default)
 AGENT_YOUTUBE_FAST = os.environ.get("AGENT_YOUTUBE_FAST", "1").lower() in ("1", "true", "yes")
@@ -59,6 +61,32 @@ YOUTUBE_EXTRA_TERMS = [
     "Ayiti",
 ]
 
+# Hashtags TikTok de baz (kreyòl / Ayiti) — konbine ak kategori
+TIKTOK_CORE_HASHTAGS: List[str] = [
+    "ayiti",
+    "ayisyen",
+    "kreyol",
+    "kreyòl",
+    "haiti",
+    "edikasyon",
+    "lekol",
+    "lekòl",
+    "aprann",
+    "formasyon",
+    "haitian",
+    "kreyòlayisyen",
+]
+
+# Requêtes YouTube fixes + kategori (parallèl)
+YOUTUBE_FIXED_QUERIES: List[str] = [
+    "ayiti edikasyon",
+    "kreyol ayisyen",
+    "formateur haiti",
+    "haiti biznis",
+    "haitian creole teacher",
+    "edikasyon an kreyòl",
+]
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -85,6 +113,38 @@ def youtube_queries_for_category(category: str, max_queries: int = 4) -> List[st
         queries.append(f"{t} {' '.join(YOUTUBE_EXTRA_TERMS[:2])}")
     queries.append(f"{normalize_category(category)} {' '.join(YOUTUBE_EXTRA_TERMS)}")
     return queries[:max_queries]
+
+
+def youtube_queries_expanded(category: str, max_queries: int = 10) -> List[str]:
+    """Mo kle YouTube: baz Ayiti + kategori, san doublo."""
+    merged: List[str] = []
+    seen: set = set()
+    for q in YOUTUBE_FIXED_QUERIES + youtube_queries_for_category(category, max_queries=8):
+        qn = (q or "").strip()
+        if not qn:
+            continue
+        key = qn.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(qn)
+        if len(merged) >= max_queries:
+            break
+    return merged if merged else ["ayiti edikasyon"]
+
+
+def tiktok_hashtags_merged(category: str) -> List[str]:
+    """Tout hashtags TikTok nan yon sèl lis pou Apify (pa yon sèl hashtag)."""
+    raw = list(TIKTOK_CORE_HASHTAGS) + hashtags_for_category(category)
+    out: List[str] = []
+    seen: set = set()
+    for h in raw:
+        t = str(h).strip().lstrip("#").lower()
+        if not t or len(t) < 2 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out[:APIFY_TIKTOK_HASHTAGS_MAX]
 
 
 def _apify_run_sync(actor_id: str, run_input: Dict[str, Any], timeout_secs: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -116,39 +176,77 @@ async def apify_run(
     return await asyncio.to_thread(_apify_run_sync, actor_id, run_input, timeout_secs)
 
 
+def _tiktok_parse_author(item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Retounen (unique_id_pou_url, username_affichage) oswa None."""
+    author = item.get("authorMeta") or item.get("author") or item.get("authorStats") or {}
+    if isinstance(author, str):
+        author = {}
+    uid = (
+        (author.get("uniqueId") or author.get("unique_id") or "").strip()
+        or (item.get("authorId") or item.get("author_id") or "").strip()
+    )
+    nick = (
+        (author.get("name") or author.get("nickname") or item.get("nickname") or "").strip()
+        or uid
+    )
+    if not uid and not nick:
+        return None
+    display = nick or uid
+    url_id = uid or nick
+    return (url_id, display)
+
+
 async def discover_tiktok_profiles(category: str, max_results: int) -> List[Dict[str, Any]]:
-    hashtags_all = hashtags_for_category(category)
-    hashtags = hashtags_all[:APIFY_TIKTOK_HASHTAG_COUNT]
-    results_cap = min(max_results, APIFY_TIKTOK_RESULTS_CAP, 30)
+    """
+    Yon sèl run Apify ak anpil hashtags (pa yon hashtag a la fwa).
+    Si 0 rezilta: verifye APIFY_API_KEY, kredi Apify, oswa hashtags twò espesifik.
+    """
+    hashtags = tiktok_hashtags_merged(category)
+    if not hashtags:
+        return []
+    results_per_page = min(
+        APIFY_TIKTOK_RESULTS_PER_PAGE,
+        max(20, min(APIFY_TIKTOK_RESULTS_CAP, max_results * 3, 80)),
+    )
     items = await apify_run(
         APIFY_TIKTOK_ACTOR,
         {
             "hashtags": hashtags,
-            "resultsPerPage": results_cap,
+            "resultsPerPage": results_per_page,
             "shouldDownloadVideos": False,
             "shouldDownloadCovers": False,
         },
     )
+    if not items:
+        logger.warning(
+            "TikTok Apify retounen 0 atik (hashtags=%s). Tcheke kle Apify ak actor %s.",
+            hashtags[:8],
+            APIFY_TIKTOK_ACTOR,
+        )
     profiles: List[Dict[str, Any]] = []
     seen: set = set()
     for item in items:
-        author = item.get("authorMeta") or item.get("author") or {}
-        name = (author.get("name") or author.get("uniqueId") or "").strip()
-        if not name:
+        parsed = _tiktok_parse_author(item)
+        if not parsed:
             continue
-        key = ("tiktok", name.lower())
+        url_id, display = parsed
+        key = ("tiktok", url_id.lower())
         if key in seen:
             continue
         seen.add(key)
-        uid = author.get("uniqueId") or name
+        author = item.get("authorMeta") or item.get("author") or {}
+        if not isinstance(author, dict):
+            author = {}
+        fans = int(author.get("fans") or author.get("followerCount") or author.get("follower_count") or 0)
+        bio = (author.get("signature") or author.get("bio") or "")[:2000]
         profiles.append(
             {
-                "username": name,
+                "username": display or url_id,
                 "platform": "tiktok",
-                "followers": int(author.get("fans") or author.get("followerCount") or 0),
-                "bio": (author.get("signature") or author.get("bio") or "")[:2000],
-                "profile_url": f"https://www.tiktok.com/@{uid}" if uid else "",
-                "snippet": (item.get("text") or item.get("desc") or "")[:500],
+                "followers": fans,
+                "bio": bio,
+                "profile_url": f"https://www.tiktok.com/@{url_id}" if url_id else "",
+                "snippet": (item.get("text") or item.get("desc") or item.get("description") or "")[:500],
             }
         )
         if len(profiles) >= max_results:
@@ -233,75 +331,127 @@ def extract_email_from_text(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def discover_youtube_channels_category(category: str, max_results: int) -> List[Dict[str, Any]]:
+def _youtube_search_channels_one_query(query: str, max_results_for_query: int) -> List[Dict[str, Any]]:
+    """Yon requèt `q` — itilize nan paralèl."""
     if not YOUTUBE_API_KEY:
         return []
-    discovered: List[Dict[str, Any]] = []
-    max_q = 2 if AGENT_YOUTUBE_FAST else 5
-    queries = youtube_queries_for_category(category, max_queries=max_q)
-    per_cap = 8 if AGENT_YOUTUBE_FAST else 25
-    per_q = max(1, min(per_cap, max_results // max(1, len(queries))))
-    for query in queries:
-        try:
-            search_resp = requests.get(
-                "https://www.googleapis.com/youtube/v3/search",
-                params={
-                    "part": "snippet",
-                    "type": "channel",
-                    "maxResults": per_q,
-                    "q": query,
-                    "key": YOUTUBE_API_KEY,
-                    "relevanceLanguage": "fr",
-                    "regionCode": "HT",
-                },
-                timeout=25,
+    out: List[Dict[str, Any]] = []
+    try:
+        search_resp = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet",
+                "type": "channel",
+                "maxResults": max(1, min(50, max_results_for_query)),
+                "q": query,
+                "key": YOUTUBE_API_KEY,
+                "relevanceLanguage": "fr",
+                "regionCode": "HT",
+            },
+            timeout=25,
+        )
+        if search_resp.status_code >= 400:
+            logger.warning("YouTube search HTTP %s pou %r", search_resp.status_code, query[:60])
+            return []
+        items = search_resp.json().get("items", [])
+        channel_ids = [i.get("id", {}).get("channelId") for i in items if i.get("id", {}).get("channelId")]
+        if not channel_ids:
+            return []
+        channels_resp = requests.get(
+            "https://www.googleapis.com/youtube/v3/channels",
+            params={
+                "part": "snippet,statistics",
+                "id": ",".join(channel_ids),
+                "key": YOUTUBE_API_KEY,
+            },
+            timeout=25,
+        )
+        if channels_resp.status_code >= 400:
+            return []
+        for ch in channels_resp.json().get("items", []):
+            sn = ch.get("snippet", {})
+            st = ch.get("statistics", {})
+            title = (sn.get("title") or "YouTube").strip()
+            desc = (sn.get("description") or "")[:2000]
+            cid = ch.get("id", "") or ""
+            handle = (sn.get("customUrl") or "").lstrip("@")
+            url = f"https://www.youtube.com/channel/{cid}" if cid else ""
+            if handle:
+                url = f"https://www.youtube.com/@{handle}"
+            out.append(
+                {
+                    "_channel_id": cid,
+                    "username": title,
+                    "platform": "youtube",
+                    "followers": int(st.get("subscriberCount") or 0),
+                    "bio": desc,
+                    "profile_url": url,
+                    "snippet": desc[:500],
+                }
             )
-            if search_resp.status_code >= 400:
-                continue
-            items = search_resp.json().get("items", [])
-            channel_ids = [i.get("id", {}).get("channelId") for i in items if i.get("id", {}).get("channelId")]
-            if not channel_ids:
-                continue
-            channels_resp = requests.get(
-                "https://www.googleapis.com/youtube/v3/channels",
-                params={
-                    "part": "snippet,statistics",
-                    "id": ",".join(channel_ids),
-                    "key": YOUTUBE_API_KEY,
-                },
-                timeout=25,
-            )
-            if channels_resp.status_code >= 400:
-                continue
-            for ch in channels_resp.json().get("items", []):
-                sn = ch.get("snippet", {})
-                st = ch.get("statistics", {})
-                title = (sn.get("title") or "YouTube").strip()
-                desc = (sn.get("description") or "")[:2000]
-                cid = ch.get("id", "")
-                handle = (sn.get("customUrl") or "").lstrip("@")
-                url = f"https://www.youtube.com/channel/{cid}" if cid else ""
-                if handle:
-                    url = f"https://www.youtube.com/@{handle}"
-                discovered.append(
-                    {
-                        "username": title,
-                        "platform": "youtube",
-                        "followers": int(st.get("subscriberCount") or 0),
-                        "bio": desc,
-                        "profile_url": url,
-                        "snippet": desc[:500],
-                    }
-                )
-        except Exception as e:
-            logger.warning("YouTube discovery: %s", e)
-    # dedupe by username
+    except Exception as e:
+        logger.warning("YouTube discovery query %r: %s", query[:80], e)
+    return out
+
+
+def _dedupe_youtube_channels(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Dedup pa id kanaal (pi solid ke sèlman tit)."""
     uniq: Dict[str, Dict[str, Any]] = {}
-    for p in discovered:
-        k = p["username"].lower()
-        if k not in uniq:
-            uniq[k] = p
-    return list(uniq.values())[:max_results]
+    for p in rows:
+        cid = (p.get("_channel_id") or "").strip()
+        key = cid if cid else (p.get("username") or "").strip().lower()
+        if not key:
+            continue
+        if key not in uniq:
+            uniq[key] = p
+    for p in uniq.values():
+        p.pop("_channel_id", None)
+    return list(uniq.values())
+
+
+def discover_youtube_channels_category(category: str, max_results: int) -> List[Dict[str, Any]]:
+    if not YOUTUBE_API_KEY:
+        logger.warning("YOUTUBE_API_KEY manke; 0 kanaal YouTube.")
+        return []
+    max_q = 4 if AGENT_YOUTUBE_FAST else 10
+    queries = youtube_queries_expanded(category, max_queries=max_q)
+    per_q = max(2, min(15, max(3, max_results * 2 // max(1, len(queries)))))
+    discovered: List[Dict[str, Any]] = []
+    workers = min(8, max(1, len(queries)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_youtube_search_channels_one_query, q, per_q): q for q in queries}
+        for fut in as_completed(futures):
+            q = futures[fut]
+            try:
+                discovered.extend(fut.result() or [])
+            except Exception as e:
+                logger.warning("YouTube parallel query %r: %s", q[:60], e)
+    deduped = _dedupe_youtube_channels(discovered)
+    deduped.sort(key=lambda x: int(x.get("followers") or 0), reverse=True)
+    return deduped[:max_results]
+
+
+async def discover_youtube_channels_category_async(category: str, max_results: int) -> List[Dict[str, Any]]:
+    """Paralèl ak asyncio.to_thread (pou route FastAPI async)."""
+    if not YOUTUBE_API_KEY:
+        return []
+    max_q = 4 if AGENT_YOUTUBE_FAST else 10
+    queries = youtube_queries_expanded(category, max_queries=max_q)
+    per_q = max(2, min(15, max(3, max_results * 2 // max(1, len(queries)))))
+    tasks = [
+        asyncio.to_thread(_youtube_search_channels_one_query, q, per_q)
+        for q in queries
+    ]
+    parts = await asyncio.gather(*tasks, return_exceptions=True)
+    discovered: List[Dict[str, Any]] = []
+    for i, p in enumerate(parts):
+        if isinstance(p, Exception):
+            logger.warning("YouTube async query: %s", p)
+            continue
+        discovered.extend(p or [])
+    deduped = _dedupe_youtube_channels(discovered)
+    deduped.sort(key=lambda x: int(x.get("followers") or 0), reverse=True)
+    return deduped[:max_results]
 
 
 CREOLE_ANALYSIS_SYSTEM = """Ou se yon espesyalis lingwistik ki idantifye si yon kreyatè kontni pale KREYÒL AYISYEN (Haitian Creole).

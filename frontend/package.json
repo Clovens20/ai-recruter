@@ -62,7 +62,7 @@
     "build": "craco build",
     "test": "craco test"
   },
-  "proxy": "http://localhost:8000",
+  "proxy": "https://magnetic-marianne-konektegroupproject-a9cd18b2.koyeb.app",
   "browserslist": {
     "production": [
       ">0.2%",

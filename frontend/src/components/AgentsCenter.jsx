@@ -80,6 +80,8 @@ export const AgentsCenter = () => {
   const [discoveredProfiles, setDiscoveredProfiles] = useState([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const [analyzeBusy, setAnalyzeBusy] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createFlash, setCreateFlash] = useState("");
 
   const selectedAgent = useMemo(
     () => agents.find((a) => a.id === selectedAgentId) || null,
@@ -190,13 +192,24 @@ export const AgentsCenter = () => {
 
   const onCreateAgent = async (e) => {
     e.preventDefault();
+    setCreateBusy(true);
     try {
-      await api.post("/agents", createForm);
+      const { data } = await api.post("/agents", createForm);
       setCreateForm(defaultCreate);
-      await loadData({ showSpinner: false });
-      window.alert("Nouvo agent kreye ak siksè.");
+      if (data?.id) {
+        setAgents((prev) => {
+          const rest = prev.filter((a) => a.id !== data.id);
+          return [data, ...rest];
+        });
+        setSelectedAgentId(data.id);
+      }
+      void loadData({ showSpinner: false });
+      setCreateFlash("Agent kreye — senkronizasyon ak baz la ap fèt an aryè.");
+      window.setTimeout(() => setCreateFlash(""), 5000);
     } catch (err) {
       window.alert(formatApiError(err));
+    } finally {
+      setCreateBusy(false);
     }
   };
 
@@ -207,6 +220,19 @@ export const AgentsCenter = () => {
       await api.patch(`/agents/${selectedAgentId}`, configForm);
       await loadData({ showSpinner: false });
       window.alert("Konfigirasyon agent mete ajou.");
+    } catch (err) {
+      window.alert(formatApiError(err));
+    }
+  };
+
+  const onDeleteAgent = async () => {
+    if (!selectedAgentId) return;
+    if (!window.confirm("Efase agent sa a definitivman? (Aksyon sa a pa retabli.)")) return;
+    try {
+      await api.delete(`/agents/${selectedAgentId}`);
+      setSelectedAgentId("");
+      await loadData({ showSpinner: false });
+      window.alert("Agent efase.");
     } catch (err) {
       window.alert(formatApiError(err));
     }
@@ -314,7 +340,17 @@ export const AgentsCenter = () => {
               Dry run
             </label>
           </div>
-          <Button type="submit">Creer agent</Button>
+          <Button type="submit" disabled={createBusy}>
+            {createBusy ? "Kreyasyon an kous..." : "Creer agent"}
+          </Button>
+          {createBusy ? (
+            <p className="text-xs text-[#94A3B8]">Anrejistreman imedyat — senkronizasyon Supabase an aryè.</p>
+          ) : null}
+          {createFlash ? (
+            <p className="text-sm text-emerald-400/90" role="status">
+              {createFlash}
+            </p>
+          ) : null}
         </form>
       ) : null}
 
@@ -358,7 +394,12 @@ export const AgentsCenter = () => {
                   Dry run
                 </label>
               </div>
-              <Button type="submit">Sauvegarder configuration</Button>
+              <div className="flex flex-wrap gap-2 items-center">
+                <Button type="submit">Sauvegarder configuration</Button>
+                <Button type="button" variant="destructive" onClick={onDeleteAgent}>
+                  Siprime agent
+                </Button>
+              </div>
             </>
           ) : (
             <p className="text-[#94A3B8]">Aucun agent disponible.</p>
