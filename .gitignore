@@ -82,5 +82,9 @@ memory/test_credentials.md
 android-sdk/frontend/node_modules/.cache/default-development/0.pack
 frontend/node_modules/.cache/default-development/0.pack
 
+# Ne jamais versionner les secrets (GitHub push protection)
+.env
+.env.*
+!.env.example
 backend/.env
 frontend/.env

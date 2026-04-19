@@ -1,0 +1,19 @@
+{
+  "name": "ai-recruter",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "install:frontend": "yarn --cwd frontend install",
+    "install:backend": "python -m pip install -r backend/requirements.txt",
+    "install:all": "npm run install:frontend && npm run install:backend",
+    "build:frontend": "yarn --cwd frontend build",
+    "dev:frontend": "yarn --cwd frontend start",
+    "dev:backend": "python -m uvicorn backend.server:app --host 0.0.0.0 --port 8000 --reload",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:unified": "npm run build:frontend && npm run dev:backend",
+    "start": "npm run build:frontend && python -m uvicorn backend.server:app --host 0.0.0.0 --port 8000"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

@@ -1,34 +1,296 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Query, Depends, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import asyncio
 import logging
 import json
+import requests
+import re
+import smtplib
+import time
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
-import uuid
+from pydantic import BaseModel, ConfigDict
+from typing import List, Optional, Dict, Any
+from openai import AsyncOpenAI
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from email.message import EmailMessage
+from uuid import uuid4
 from datetime import datetime, timezone
-from emergentintegrations.llm.chat import LlmChat, UserMessage
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+ROOT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = ROOT_DIR.parent
+# Racine du depot en premier (ex. C:\...\ai-recruter\.env), puis backend/.env pour surcharges locales
+load_dotenv(REPO_ROOT / ".env")
+load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Supabase connection (PostgREST API)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_REST_URL = f"{SUPABASE_URL.rstrip('/')}/rest/v1" if SUPABASE_URL else ""
+SUPABASE_AUTH_URL = f"{SUPABASE_URL.rstrip('/')}/auth/v1" if SUPABASE_URL else ""
+SUPABASE_AUTH_KEY = os.environ.get("SUPABASE_AUTH_KEY", SUPABASE_KEY)
 
 # LLM Config
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+AGENT_LLM_MODEL = os.environ.get("OPENAI_AGENT_MODEL", "gpt-4o")
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+try:
+    from . import agent_recruiter as agent_rc
+except ImportError:
+    import agent_recruiter as agent_rc
+PROJECT_URL = os.environ.get("PROJECT_URL", "https://www.konektegroup.com")
+PROJECT_SIGNUP_URL = os.environ.get("PROJECT_SIGNUP_URL", "https://www.konektegroup.com")
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "noreply@konektegroup.com")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+YOUTUBE_DISCOVERY_QUERIES = [
+    q.strip()
+    for q in os.environ.get(
+        "YOUTUBE_DISCOVERY_QUERIES",
+        "haitian educator,haitian coach,haitian teacher,kreyol edikasyon,haitian business coach",
+    ).split(",")
+    if q.strip()
+]
+TARGET_DOMAINS = [
+    d.strip().lower()
+    for d in os.environ.get(
+        "TARGET_DOMAINS",
+        "math,sciences,langues,tech,business,developpement personnel",
+    ).split(",")
+    if d.strip()
+]
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
+auth_router = APIRouter(prefix="/api/auth")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.warning("SUPABASE_URL or SUPABASE_KEY is missing. Some data endpoints will use in-memory fallback.")
+
+FRONTEND_BUILD_DIR = REPO_ROOT / "frontend" / "build"
+security_scheme = HTTPBearer(auto_error=False)
+
+# Fallback memoire quand Supabase / PostgREST indisponible (ex. PGRST002, plan Free)
+OFFLINE_LEADS: List[Dict[str, Any]] = []
+OFFLINE_AGENT_CONFIGS: List[Dict[str, Any]] = []
+OFFLINE_AGENT_RUNS: List[Dict[str, Any]] = []
+
+
+def _is_transient_supabase_failure(exc: BaseException) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError, OSError)):
+        return True
+    if isinstance(exc, HTTPException):
+        if exc.status_code in (502, 503, 504):
+            return True
+        d = str(exc.detail or "").lower()
+        if "pgrst" in d or "schema cache" in d:
+            return True
+        if "schema" in d and "does not exist" in d:
+            return True
+    return False
+
+
+def _supabase_try_call(
+    method: str,
+    path: str,
+    params: Optional[dict] = None,
+    payload: Optional[dict] = None,
+) -> Optional[List[Any]]:
+    """
+    Retounen list JSON si siksè, None si non konfigire oswa erè transitoire.
+    Leve HTTPException si erè non-transitoire.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        return supabase_request(method, path, params=params, payload=payload) or []
+    except HTTPException as e:
+        if _is_transient_supabase_failure(e):
+            logger.warning("Supabase indisponible (transitoire), fallback memoire: %s", e.detail)
+            return None
+        raise
+    except (requests.Timeout, requests.ConnectionError, OSError) as e:
+        logger.warning("Supabase rezo/timeout, fallback memoire: %s", e)
+        return None
+
+
+def _supabase_try_list(method: str, path: str, params: Optional[dict] = None) -> Optional[List[Any]]:
+    return _supabase_try_call(method, path, params=params, payload=None)
+
+
+def _filter_leads_local(
+    leads: List[Dict[str, Any]],
+    status: Optional[str],
+    platform: Optional[str],
+    min_score: Optional[int],
+    max_score: Optional[int],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for l in leads:
+        if status and l.get("status") != status:
+            continue
+        if platform and str(l.get("platform", "")).lower() != platform.lower():
+            continue
+        sc = int(l.get("score") or 0)
+        if min_score is not None and sc < min_score:
+            continue
+        if max_score is not None and sc > max_score:
+            continue
+        out.append(l)
+    return out
+
+
+def ensure_supabase_auth_config():
+    if not SUPABASE_AUTH_URL or not SUPABASE_AUTH_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Supabase Auth is not configured. Set SUPABASE_URL and SUPABASE_AUTH_KEY (or SUPABASE_KEY).",
+        )
+
+
+def supabase_auth_headers(bearer_token: Optional[str] = None) -> dict:
+    ensure_supabase_auth_config()
+    headers = {
+        "apikey": SUPABASE_AUTH_KEY,
+        "Content-Type": "application/json",
+    }
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    return headers
+
+
+def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme)) -> str:
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+    try:
+        response = requests.get(
+            f"{SUPABASE_AUTH_URL}/user",
+            headers=supabase_auth_headers(credentials.credentials),
+            timeout=20,
+        )
+        if response.status_code >= 400:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token.")
+        user = response.json()
+        return user.get("email", "") or user.get("id", "")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token.")
+
+
+def ensure_supabase_config():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in .env at repo root or in backend/.env.",
+        )
+
+
+def supabase_request(method: str, path: str, params: Optional[dict] = None, payload: Optional[dict] = None):
+    ensure_supabase_config()
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    url = f"{SUPABASE_REST_URL}{path}"
+    max_attempts = max(2, min(12, int(os.environ.get("SUPABASE_MAX_ATTEMPTS", "8"))))
+
+    for attempt in range(1, max_attempts + 1):
+        response = requests.request(method, url, headers=headers, params=params, json=payload, timeout=45)
+        body_text = response.text or ""
+
+        if response.status_code < 400:
+            if not response.text:
+                return []
+            return response.json()
+
+        body_lower = body_text.lower()
+        is_schema_cache_retryable = response.status_code == 503 and (
+            "pgrst002" in body_lower
+            or "schema cache" in body_lower
+        )
+        if is_schema_cache_retryable and attempt < max_attempts:
+            sleep_s = min(45.0, 2.0 ** (attempt - 1))
+            logger.warning(
+                "Supabase schema cache indisponible (tentative %s/%s). Nouvelle tentative dans %.1fs...",
+                attempt,
+                max_attempts,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+            continue
+
+        logger.error("Supabase request failed (%s): %s", response.status_code, body_text[:800])
+        if is_schema_cache_retryable:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Supabase reponn 503 (cache schema / PGRST002) apre plizye esè. "
+                    "Atann 1 a 2 minit, verifye pwojè a an ligne, epi reessaeye. "
+                    f"Fragment: {body_text[:600]}"
+                ),
+            )
+        detail_msg = (body_text or response.reason or "Supabase request failed")[:4000]
+        try:
+            err_json = response.json()
+            if isinstance(err_json, dict):
+                msg = err_json.get("message") or err_json.get("error_description")
+                hint = err_json.get("hint")
+                code = err_json.get("code")
+                if msg:
+                    detail_msg = msg
+                    if hint:
+                        detail_msg = f"{detail_msg} ({hint})"
+                    if code:
+                        detail_msg = f"{detail_msg} [{code}]"
+        except Exception:
+            pass
+        resp_status = response.status_code if 400 <= response.status_code < 600 else 500
+        raise HTTPException(status_code=resp_status, detail=detail_msg)
+
+    raise HTTPException(status_code=500, detail="Supabase request failed")
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def build_agent_settings_from_request(data) -> Dict[str, Any]:
+    return {
+        "dry_run": data.dry_run,
+        "max_profiles": data.max_profiles,
+        "discover_youtube": data.discover_youtube,
+        "youtube_max_results": data.youtube_max_results,
+    }
+
+
+def merge_agent_settings(current: Dict[str, Any], update) -> Dict[str, Any]:
+    merged = dict(current or {})
+    if update.dry_run is not None:
+        merged["dry_run"] = update.dry_run
+    if update.max_profiles is not None:
+        merged["max_profiles"] = update.max_profiles
+    if update.discover_youtube is not None:
+        merged["discover_youtube"] = update.discover_youtube
+    if update.youtube_max_results is not None:
+        merged["youtube_max_results"] = update.youtube_max_results
+    return merged
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
@@ -38,6 +300,7 @@ class ProfileInput(BaseModel):
     platform: str  # facebook, tiktok, youtube
     followers: int
     content_example: str
+    email: Optional[str] = None
 
 class ProfileAnalysis(BaseModel):
     is_educator: bool
@@ -54,6 +317,7 @@ class LeadResponse(BaseModel):
     platform: str
     followers: int
     content_example: str
+    email: Optional[str] = None
     is_educator: bool
     domain: str
     potential: str
@@ -74,6 +338,182 @@ class StatsResponse(BaseModel):
     high_potential: int
     medium_potential: int
     low_potential: int
+
+
+def _stats_from_leads_rows(all_leads: List[Dict[str, Any]]) -> StatsResponse:
+    total = len(all_leads)
+    by_status: Dict[str, int] = {}
+    by_platform: Dict[str, int] = {}
+    total_score = 0
+    high = medium = low = 0
+    for lead in all_leads:
+        s = lead.get("status", "new")
+        by_status[s] = by_status.get(s, 0) + 1
+        p = lead.get("platform", "unknown")
+        by_platform[p] = by_platform.get(p, 0) + 1
+        total_score += int(lead.get("score") or 0)
+        pot = lead.get("potential", "moyen")
+        if pot == "eleve":
+            high += 1
+        elif pot == "moyen":
+            medium += 1
+        else:
+            low += 1
+    return StatsResponse(
+        total=total,
+        by_status=by_status,
+        by_platform=by_platform,
+        avg_score=round(total_score / total, 1) if total > 0 else 0.0,
+        high_potential=high,
+        medium_potential=medium,
+        low_potential=low,
+    )
+
+
+def _offline_append_agent_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    OFFLINE_AGENT_CONFIGS.insert(0, row)
+    return row
+
+
+def _offline_append_lead_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    OFFLINE_LEADS.insert(0, row)
+    return row
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in_hours: int
+
+
+class AgentRunRequest(BaseModel):
+    dry_run: bool = False
+    max_profiles: int = 25
+    discover_youtube: bool = True
+    youtube_max_results: int = 20
+
+
+class AgentRunResponse(BaseModel):
+    run_id: str
+    discovered: int
+    scanned: int
+    selected: int
+    emailed: int
+    dry_run: bool
+    summary: str
+
+
+class AgentConfigCreateRequest(BaseModel):
+    name: str
+    function_type: str
+    enabled: bool = True
+    dry_run: bool = False
+    max_profiles: int = 25
+    discover_youtube: bool = True
+    youtube_max_results: int = 20
+
+
+class AgentConfigUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    function_type: Optional[str] = None
+    enabled: Optional[bool] = None
+    dry_run: Optional[bool] = None
+    max_profiles: Optional[int] = None
+    discover_youtube: Optional[bool] = None
+    youtube_max_results: Optional[int] = None
+
+
+class AgentConfigResponse(BaseModel):
+    id: str
+    name: str
+    function_type: str
+    enabled: bool
+    settings: Dict[str, Any]
+    created_by: Optional[str] = None
+    created_at: str
+    updated_at: Optional[str] = None
+
+
+class AgentRunRecordResponse(BaseModel):
+    id: str
+    agent_id: Optional[str] = None
+    agent_name: Optional[str] = None
+    status: str
+    run_type: str
+    summary: Optional[str] = None
+    details: Dict[str, Any] = {}
+    triggered_by: Optional[str] = None
+    started_at: str
+    finished_at: Optional[str] = None
+
+
+class AgentProfilePayload(BaseModel):
+    """Pwofil agent (API) — alinye ak modèl Profile demann nan PRD."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: Optional[str] = None
+    username: str
+    platform: str
+    category: str = "Lòt"
+    followers: int = 0
+    bio: str = ""
+    profile_url: str = ""
+    email: Optional[str] = None
+    creole_score: int = 0
+    status: str = "found"
+    created_at: Optional[str] = None
+
+
+class AgentSearchRequest(BaseModel):
+    category: str
+    platforms: List[str]
+    max_results: int = 20
+
+
+class AgentSearchResponse(BaseModel):
+    profiles: List[AgentProfilePayload]
+    count: int
+
+
+class AgentAnalyzeRequest(BaseModel):
+    profiles: List[AgentProfilePayload]
+
+
+class AgentAnalyzeResponse(BaseModel):
+    profiles: List[AgentProfilePayload]
+    count: int
+
+
+class AgentSendEmailRequest(BaseModel):
+    profile_id: str
+    profile: AgentProfilePayload
+    dry_run: bool = False
+
+
+class AgentSendEmailResponse(BaseModel):
+    ok: bool
+    dry_run: bool
+    message: str
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    resend_id: Optional[str] = None
+
+
+class AgentStatusResponse(BaseModel):
+    openai_configured: bool
+    youtube_configured: bool
+    apify_configured: bool
+    resend_configured: bool
+    smtp_configured: bool
+    agent_model: str
+    categories: List[str]
+    message: str
 
 # ─── AI Service ───────────────────────────────────────────────────────────────
 
@@ -100,42 +540,147 @@ Criteres de scoring:
 - Plateforme adaptee (YouTube > TikTok > Facebook pour l'education) = +10pts
 - Engagement potentiel = +20pts"""
 
-MESSAGE_SYSTEM_PROMPT = """Tu es un expert en communication et recrutement pour Konekte Group, une plateforme educative innovante en Haiti et dans le monde francophone.
+MESSAGE_SYSTEM_PROMPT = """Ou se yon espesyalis nan kominikasyon ak rekritman pou Konekte Group, yon platfom edikatif inovant ann Ayiti.
 
-Tu dois generer un message de recrutement personnalise, naturel et non-spam.
+Objektif ou: ekri yon mesaj rekritman ki personalize, natirel, epi ki pa sanble spam.
 
-Le message DOIT:
-- Mentionner un element specifique du contenu de la personne
-- Presenter Konekte Group comme une opportunite excitante
-- Etre chaleureux et professionnel
-- Inviter a discuter sans pression
-- Etre en francais
-- Faire entre 3 et 5 phrases maximum
+RANFOSMAN LANG:
+- Tout mesaj la DWE an KREYOL AYISYEN 100%.
+- Pa itilize franse, pa itilize angle, pa melanje lang.
+- Si w bezwen yon mo teknik, ekri li jan moun ann Ayiti itilize li, men toujou nan fraz kreyol.
 
-Reponds UNIQUEMENT avec le texte du message, sans guillemets ni formatage supplementaire."""
+Mesaj la DWE:
+- Site yon eleman spesifik nan kontni moun nan
+- Prezante Konekte Group tankou yon opotinite serye
+- Rete cho, pwofesyonel, ak respekte moun nan
+- Envite moun nan diskite san presyon
+- Gen ant 3 ak 5 fraz maksimum
+
+Reponn SELMAN ak teks mesaj la, san guillemets, san markdown, san lot fomataj."""
+
+
+NON_KREYOL_MARKERS = {
+    # French markers
+    "bonjour", "merci", "recrutement", "plateforme", "educative", "discuter",
+    "votre", "nous", "avec", "pour", "sans", "pression", "opportunite",
+    # English markers
+    "hello", "thanks", "opportunity", "platform", "educational", "recruitment",
+    "discuss", "message", "professional", "warm", "content creator",
+}
+
+
+def is_message_mostly_kreyol(message: str) -> bool:
+    """Heuristic guard: reject obvious French/English mixed messages."""
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    for marker in NON_KREYOL_MARKERS:
+        if marker in text:
+            return False
+    return True
+
+
+def compute_recruitment_fit_adjustments(profile: ProfileInput, analysis: dict) -> dict:
+    """Adjust AI output with deterministic Konekte recruitment criteria."""
+    domain = str(analysis.get("domain", "general")).strip().lower() or "general"
+    raw_score = int(analysis.get("score", 50) or 50)
+    score = max(0, min(100, raw_score))
+    is_educator = bool(analysis.get("is_educator", False))
+    platform = profile.platform.lower().strip()
+    combined_text = f"{profile.bio} {profile.content_example}".lower()
+
+    educational_keywords = [
+        "prof",
+        "enseign",
+        "coach",
+        "formateur",
+        "formation",
+        "cours",
+        "tutoriel",
+        "education",
+        "pedagog",
+        "apprendre",
+        "eleve",
+        "etudiant",
+    ]
+    has_educational_signals = any(k in combined_text for k in educational_keywords)
+
+    if has_educational_signals:
+        score += 10
+    if domain in TARGET_DOMAINS:
+        score += 10
+
+    if profile.followers >= 100000:
+        score += 20
+    elif profile.followers >= 10000:
+        score += 12
+    elif profile.followers >= 1000:
+        score += 6
+
+    if platform == "youtube":
+        score += 8
+    elif platform == "tiktok":
+        score += 4
+    elif platform == "facebook":
+        score += 2
+
+    if not is_educator:
+        score = min(score, 35)
+    if not has_educational_signals:
+        score -= 8
+
+    score = max(0, min(100, score))
+    if score >= 75:
+        potential = "eleve"
+    elif score >= 45:
+        potential = "moyen"
+    else:
+        potential = "faible"
+
+    base_reasoning = str(analysis.get("reasoning", "")).strip()
+    adjustment_notes = []
+    if domain in TARGET_DOMAINS:
+        adjustment_notes.append("domaine prioritaire Konekte")
+    if has_educational_signals:
+        adjustment_notes.append("fort signal pedagogique")
+    if profile.followers >= 10000:
+        adjustment_notes.append("audience solide")
+
+    reasoning_suffix = f" Ajustement Konekte: {', '.join(adjustment_notes)}." if adjustment_notes else ""
+    return {
+        "is_educator": is_educator,
+        "domain": domain,
+        "potential": potential,
+        "score": score,
+        "reasoning": (base_reasoning or "Analyse orientee recrutement formateur.") + reasoning_suffix,
+    }
 
 
 async def analyze_profile_with_ai(profile: ProfileInput) -> dict:
     """Use AI to analyze a profile and determine educator potential."""
     try:
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"analysis-{uuid.uuid4()}",
-            system_message=ANALYSIS_SYSTEM_PROMPT
-        ).with_model("openai", "gpt-4o")
+        if not openai_client:
+            raise RuntimeError("OPENAI_API_KEY is not set")
 
-        user_msg = UserMessage(
-            text=f"""Analyse ce profil:
+        completion = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"""Analyse ce profil:
 - Nom: {profile.name}
 - Bio: {profile.bio}
 - Plateforme: {profile.platform}
 - Abonnes: {profile.followers}
-- Exemple de contenu: {profile.content_example}"""
+- Exemple de contenu: {profile.content_example}""",
+                },
+            ],
         )
 
-        response = await chat.send_message(user_msg)
-        # Parse JSON from response
-        cleaned = response.strip()
+        response_text = completion.choices[0].message.content or "{}"
+        cleaned = response_text.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
             if cleaned.endswith("```"):
@@ -143,64 +688,417 @@ async def analyze_profile_with_ai(profile: ProfileInput) -> dict:
             cleaned = cleaned.strip()
 
         analysis = json.loads(cleaned)
-        return analysis
+        return compute_recruitment_fit_adjustments(profile, analysis)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse AI analysis response: {e}")
         # Fallback analysis
         score = min(100, max(0, profile.followers // 1000 + 30))
-        return {
+        fallback = {
             "is_educator": True,
             "domain": "general",
             "potential": "moyen" if score > 40 else "faible",
             "score": score,
             "reasoning": "Analyse automatique basee sur les metriques du profil."
         }
+        return compute_recruitment_fit_adjustments(profile, fallback)
     except Exception as e:
         logger.error(f"AI analysis error: {e}")
         score = min(100, max(0, profile.followers // 1000 + 30))
-        return {
+        fallback = {
             "is_educator": True,
             "domain": "general",
             "potential": "moyen" if score > 40 else "faible",
             "score": score,
             "reasoning": "Analyse automatique basee sur les metriques du profil."
         }
+        return compute_recruitment_fit_adjustments(profile, fallback)
 
 
 async def generate_recruitment_message(profile: ProfileInput, analysis: dict) -> str:
     """Use AI to generate a personalized recruitment message."""
     try:
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"message-{uuid.uuid4()}",
-            system_message=MESSAGE_SYSTEM_PROMPT
-        ).with_model("openai", "gpt-4o")
+        if not openai_client:
+            raise RuntimeError("OPENAI_API_KEY is not set")
 
-        user_msg = UserMessage(
-            text=f"""Genere un message de recrutement pour cette personne:
+        user_prompt = f"""Genere un message de recrutement pour cette personne:
 - Nom: {profile.name}
 - Plateforme: {profile.platform}
 - Domaine: {analysis.get('domain', 'education')}
 - Contenu: {profile.content_example}
-- Score: {analysis.get('score', 50)}/100"""
-        )
+- Score: {analysis.get('score', 50)}/100
 
-        response = await chat.send_message(user_msg)
-        return response.strip()
+Rappel critique: mesaj final la dwe an kreyol ayisyen 100%."""
+
+        for attempt in range(3):
+            completion = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": MESSAGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            candidate = (completion.choices[0].message.content or "").strip()
+            if is_message_mostly_kreyol(candidate):
+                return candidate
+
+            logger.warning("Generated message rejected (non-kreyol) on attempt %s", attempt + 1)
+            user_prompt = (
+                f"{user_prompt}\n\nKoreksyon obligatwa: "
+                "Re-ekri mesaj la an kreyol ayisyen selman, pa mete okenn mo franse oswa angle."
+            )
     except Exception as e:
         logger.error(f"Message generation error: {e}")
-        return f"Bonjour {profile.name}, votre contenu sur {profile.platform} est remarquable! Konekte Group cherche des talents comme vous pour rejoindre notre plateforme educative. Seriez-vous disponible pour en discuter?"
+    return f"Bonjou {profile.name}, mwen remake kontni ou ap fe sou {profile.platform} la epi li vreman enteresan. Konekte Group ap chache bon fomate tankou ou pou ede plis moun aprann. Eske ou ta disponib pou nou pale tou kout sou sa?"
+
+
+def fetch_project_context() -> str:
+    """Fetch and normalize project website context for outreach personalization."""
+    try:
+        resp = requests.get(PROJECT_URL, timeout=20)
+        if resp.status_code >= 400:
+            return "Konekte Group se yon platfom edikatif ki konekte aprenan ak bon fomate."
+        text = re.sub(r"<[^>]+>", " ", resp.text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:2500] or "Konekte Group se yon platfom edikatif ki konekte aprenan ak bon fomate."
+    except Exception:
+        return "Konekte Group se yon platfom edikatif ki konekte aprenan ak bon fomate."
+
+
+async def generate_outreach_email_kreyol(profile: dict, project_context: str) -> str:
+    """Generate outbound outreach email in Haitian Creole only."""
+    if not openai_client:
+        return (
+            f"Bonjou {profile.get('name', '')}, nou se ekip Konekte Group. "
+            f"Nou remake travay ou ap fe a epi nou ta renmen envite ou vin kreye kont ou sou platfom nan: {PROJECT_SIGNUP_URL}. "
+            "Si ou dakò, reponn imel sa a pou nou pale plis."
+        )
+
+    system_prompt = (
+        "Ou se yon ajan rekritman pou Konekte Group. "
+        "Ekri yon imèl kout an kreyòl ayisyen 100%, pwofesyonèl, cho, klè, san franse/angle. "
+        "Objektif la se envite moun nan pou l kreye kont li sou platfòm la."
+    )
+    user_prompt = f"""
+Enfòmasyon pwofil:
+- Non: {profile.get('name', '')}
+- Platfòm: {profile.get('platform', '')}
+- Bio: {profile.get('bio', '')}
+- Kontni: {profile.get('content_example', '')}
+- Domèn: {profile.get('domain', '')}
+
+Kontèks pwojè:
+{project_context}
+
+Kondisyon:
+- 3-5 fraz
+- Mete lyen enskripsyon sa a egzakteman: {PROJECT_SIGNUP_URL}
+- Pa mete markdown, pa mete baliz
+"""
+    completion = await openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+    )
+    candidate = (completion.choices[0].message.content or "").strip()
+    if not is_message_mostly_kreyol(candidate):
+        return (
+            f"Bonjou {profile.get('name', '')}, nou apresye kalite kontni ou yo. "
+            f"Konekte Group ta renmen travay avè w kòm fomate sou platfòm la. "
+            f"Tanpri kreye kont ou dirèkteman isit la: {PROJECT_SIGNUP_URL}. "
+            "Si ou enterese, reponn mesaj sa a pou pwochen etap yo."
+        )
+    return candidate
+
+
+def send_email_smtp(to_email: str, subject: str, body: str) -> bool:
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
+        logger.warning("SMTP not configured: skipping email send.")
+        return False
+    try:
+        msg = EmailMessage()
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        logger.error("SMTP send failed for %s: %s", to_email, e)
+        return False
+
+
+def extract_email_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    return match.group(0) if match else None
+
+
+def discover_youtube_channels(max_results: int) -> List[dict]:
+    """Discover Haitian creator channels using YouTube Data API."""
+    if not YOUTUBE_API_KEY:
+        logger.warning("YOUTUBE_API_KEY is missing; skipping YouTube discovery.")
+        return []
+
+    discovered = []
+    per_query = max(1, min(25, max_results // max(1, len(YOUTUBE_DISCOVERY_QUERIES))))
+    for query in YOUTUBE_DISCOVERY_QUERIES:
+        try:
+            search_resp = requests.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "part": "snippet",
+                    "type": "channel",
+                    "maxResults": per_query,
+                    "q": query,
+                    "key": YOUTUBE_API_KEY,
+                    "regionCode": "HT",
+                },
+                timeout=20,
+            )
+            if search_resp.status_code >= 400:
+                logger.warning("YouTube search failed for query '%s': %s", query, search_resp.text)
+                continue
+
+            items = search_resp.json().get("items", [])
+            channel_ids = [i.get("id", {}).get("channelId") for i in items if i.get("id", {}).get("channelId")]
+            if not channel_ids:
+                continue
+
+            channels_resp = requests.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={
+                    "part": "snippet,statistics",
+                    "id": ",".join(channel_ids),
+                    "key": YOUTUBE_API_KEY,
+                },
+                timeout=20,
+            )
+            if channels_resp.status_code >= 400:
+                logger.warning("YouTube channels lookup failed for query '%s': %s", query, channels_resp.text)
+                continue
+
+            for item in channels_resp.json().get("items", []):
+                snippet = item.get("snippet", {})
+                stats = item.get("statistics", {})
+                description = snippet.get("description", "") or ""
+                discovered.append(
+                    {
+                        "name": snippet.get("title", "Unknown Creator"),
+                        "bio": description[:1000] or "Kreyatè kontni sou YouTube.",
+                        "platform": "youtube",
+                        "followers": int(stats.get("subscriberCount") or 0),
+                        "content_example": (description[:200] or "Kontni YouTube pou kominote a."),
+                        "email": extract_email_from_text(description),
+                    }
+                )
+        except Exception as e:
+            logger.warning("YouTube discovery error for query '%s': %s", query, e)
+
+    # Deduplicate by normalized channel name
+    unique = {}
+    for profile in discovered:
+        key = (profile.get("name") or "").strip().lower()
+        if key and key not in unique:
+            unique[key] = profile
+    return list(unique.values())[:max_results]
+
+
+async def upsert_discovered_profiles(profiles: List[dict], dry_run: bool) -> int:
+    discovered_count = 0
+    for profile in profiles:
+        # Skip empty names
+        if not (profile.get("name") or "").strip():
+            continue
+
+        if dry_run:
+            discovered_count += 1
+            continue
+
+        existing = supabase_request(
+            "GET",
+            "/leads",
+            params={
+                "select": "id",
+                "platform": f"eq.{profile['platform']}",
+                "name": f"eq.{profile['name']}",
+                "limit": "1",
+            },
+        )
+        if existing:
+            continue
+
+        profile_input = ProfileInput(
+            name=profile["name"],
+            bio=profile.get("bio", ""),
+            platform=profile["platform"],
+            followers=profile.get("followers", 0),
+            content_example=profile.get("content_example", ""),
+            email=profile.get("email"),
+        )
+        analysis = await analyze_profile_with_ai(profile_input)
+        lead_doc = {
+            "name": profile_input.name,
+            "bio": profile_input.bio,
+            "platform": profile_input.platform,
+            "followers": profile_input.followers,
+            "content_example": profile_input.content_example,
+            "email": profile_input.email,
+            "is_educator": analysis.get("is_educator", False),
+            "domain": analysis.get("domain", "general"),
+            "potential": analysis.get("potential", "moyen"),
+            "score": analysis.get("score", 50),
+            "reasoning": analysis.get("reasoning", ""),
+            "generated_message": "",
+            "status": "new",
+        }
+        supabase_request("POST", "/leads", payload=lead_doc)
+        discovered_count += 1
+
+    return discovered_count
+
+
+async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
+    """Execute one full discovery + outreach cycle and return metrics."""
+    run_id = str(uuid4())
+    project_context = fetch_project_context()
+    discovered_count = 0
+
+    if payload.discover_youtube:
+        youtube_profiles = discover_youtube_channels(max_results=max(1, min(payload.youtube_max_results, 100)))
+        discovered_count = await upsert_discovered_profiles(youtube_profiles, dry_run=payload.dry_run)
+
+    params = {
+        "select": "id,name,bio,platform,followers,content_example,email,domain,potential,score,status",
+        "status": "eq.new",
+        "order": "score.desc",
+        "limit": str(max(1, min(payload.max_profiles, 100))),
+    }
+    leads = supabase_request("GET", "/leads", params=params)
+    scanned = len(leads)
+    selected_rows = [
+        lead for lead in leads
+        if lead.get("potential") in ("eleve", "moyen") and (lead.get("email") or "").strip()
+    ]
+
+    emailed = 0
+    if not payload.dry_run:
+        for lead in selected_rows:
+            email_body = await generate_outreach_email_kreyol(lead, project_context)
+            sent = send_email_smtp(
+                to_email=lead["email"].strip(),
+                subject="Opotinite pou vin fomate sou Konekte Group",
+                body=email_body,
+            )
+            if sent:
+                emailed += 1
+                supabase_request(
+                    "PATCH",
+                    "/leads",
+                    params={"id": f"eq.{lead['id']}", "select": "*"},
+                    payload={"status": "contacted"},
+                )
+
+    summary = (
+        f"Run {run_id}: {discovered_count} nouvo pwofil dekouvri, {scanned} pwofil analize, "
+        f"{len(selected_rows)} pwofil seleksyone, {emailed if not payload.dry_run else 0} imel voye."
+    )
+    return {
+        "run_id": run_id,
+        "discovered": discovered_count,
+        "scanned": scanned,
+        "selected": len(selected_rows),
+        "emailed": 0 if payload.dry_run else emailed,
+        "dry_run": payload.dry_run,
+        "summary": summary,
+    }
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
+@auth_router.post("/login", response_model=LoginResponse)
+async def login(data: LoginRequest):
+    ensure_supabase_auth_config()
+    payload = {
+        "email": data.email.strip().lower(),
+        "password": data.password,
+    }
+    response = requests.post(
+        f"{SUPABASE_AUTH_URL}/token?grant_type=password",
+        headers=supabase_auth_headers(),
+        json=payload,
+        timeout=20,
+    )
+    if response.status_code >= 400:
+        detail = "Email ou mot de passe invalide."
+        try:
+            error_json = response.json()
+            detail = error_json.get("msg") or error_json.get("error_description") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
+
+    auth_data = response.json()
+    access_token = auth_data.get("access_token", "")
+    expires_in_seconds = int(auth_data.get("expires_in") or 3600)
+    if not access_token:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Login token missing.")
+
+    expires_hours = max(1, (expires_in_seconds + 3599) // 3600)
+    return LoginResponse(access_token=access_token, expires_in_hours=expires_hours)
+
+
+@auth_router.get("/me")
+async def me(current_user: str = Depends(require_auth)):
+    return {"email": current_user}
+
+
 @api_router.get("/")
-async def root():
+async def root(current_user: str = Depends(require_auth)):
     return {"message": "Konekte AI Recruiter Agent API"}
 
 
+@api_router.get("/health")
+async def health_public():
+    """Diagnostic leje: pa mande token."""
+    return {
+        "ok": True,
+        "supabase_env_configured": bool(SUPABASE_URL and SUPABASE_KEY),
+    }
+
+
+@api_router.get("/health/supabase")
+async def health_supabase(current_user: str = Depends(require_auth)):
+    """
+    Teste yon reket REST Supabase (leads, limit 1).
+    Retounen 200 ak ok: false si erè (pou li fasil nan devtools).
+    """
+    try:
+        t0 = time.time()
+        rows = supabase_request("GET", "/leads", params={"select": "id", "limit": "1"})
+        return {
+            "ok": True,
+            "sample_rows": len(rows or []),
+            "latency_ms": round((time.time() - t0) * 1000, 1),
+            "user": current_user,
+        }
+    except HTTPException as he:
+        return {
+            "ok": False,
+            "http_status": he.status_code,
+            "detail": he.detail,
+            "hint": (
+                "Si 503: souvan cache schema Supabase; tann e reessaeye. "
+                "Si 42P01: execute backend/supabase_schema.sql. "
+                "Verifye SUPABASE_URL ak SUPABASE_KEY (service_role si RLS)."
+            ),
+        }
+
+
 @api_router.post("/analyze-profile", response_model=LeadResponse)
-async def analyze_profile(profile: ProfileInput):
+async def analyze_profile(profile: ProfileInput, current_user: str = Depends(require_auth)):
     """Analyze a profile using AI and save as a lead."""
     # AI Analysis
     analysis = await analyze_profile_with_ai(profile)
@@ -208,30 +1106,33 @@ async def analyze_profile(profile: ProfileInput):
     # Generate recruitment message
     message = await generate_recruitment_message(profile, analysis)
 
-    # Create lead document
-    lead_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
+    # Create lead record
     lead_doc = {
-        "id": lead_id,
         "name": profile.name,
         "bio": profile.bio,
         "platform": profile.platform.lower(),
         "followers": profile.followers,
         "content_example": profile.content_example,
+        "email": profile.email,
         "is_educator": analysis.get("is_educator", False),
         "domain": analysis.get("domain", "general"),
         "potential": analysis.get("potential", "moyen"),
         "score": analysis.get("score", 50),
         "reasoning": analysis.get("reasoning", ""),
         "generated_message": message,
-        "status": "new",
-        "created_at": now
+        "status": "new"
     }
 
-    await db.leads.insert_one(lead_doc)
-
-    return LeadResponse(**lead_doc)
+    inserted_rows = _supabase_try_call("POST", "/leads", payload=lead_doc)
+    if inserted_rows:
+        return LeadResponse(**inserted_rows[0])
+    row = {
+        "id": str(uuid4()),
+        "created_at": utc_now_iso(),
+        **lead_doc,
+    }
+    _offline_append_lead_row(row)
+    return LeadResponse(**row)
 
 
 @api_router.get("/leads", response_model=List[LeadResponse])
@@ -240,95 +1141,78 @@ async def get_leads(
     platform: Optional[str] = Query(None),
     min_score: Optional[int] = Query(None),
     max_score: Optional[int] = Query(None),
+    current_user: str = Depends(require_auth),
 ):
     """Get all leads with optional filtering."""
-    query = {}
+    params = {"select": "*", "order": "created_at.desc", "limit": "500"}
     if status:
-        query["status"] = status
+        params["status"] = f"eq.{status}"
     if platform:
-        query["platform"] = platform.lower()
-    if min_score is not None or max_score is not None:
-        score_filter = {}
-        if min_score is not None:
-            score_filter["$gte"] = min_score
-        if max_score is not None:
-            score_filter["$lte"] = max_score
-        query["score"] = score_filter
+        params["platform"] = f"eq.{platform.lower()}"
+    if min_score is not None and max_score is not None:
+        params["and"] = f"(score.gte.{min_score},score.lte.{max_score})"
+    elif min_score is not None:
+        params["score"] = f"gte.{min_score}"
+    elif max_score is not None:
+        params["score"] = f"lte.{max_score}"
 
-    leads = await db.leads.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return leads
+    rows = _supabase_try_list("GET", "/leads", params=params)
+    if rows is None:
+        return _filter_leads_local(OFFLINE_LEADS, status, platform, min_score, max_score)
+    return rows
 
 
 @api_router.patch("/leads/{lead_id}/status")
-async def update_lead_status(lead_id: str, update: LeadStatusUpdate):
+async def update_lead_status(lead_id: str, update: LeadStatusUpdate, current_user: str = Depends(require_auth)):
     """Update the status of a lead."""
     if update.status not in ["new", "contacted", "replied"]:
         raise HTTPException(status_code=400, detail="Status must be: new, contacted, or replied")
 
-    result = await db.leads.update_one(
-        {"id": lead_id},
-        {"$set": {"status": update.status}}
+    result = supabase_request(
+        "PATCH",
+        "/leads",
+        params={"id": f"eq.{lead_id}", "select": "*"},
+        payload={"status": update.status},
     )
-    if result.matched_count == 0:
+    if not result:
         raise HTTPException(status_code=404, detail="Lead not found")
 
     return {"message": "Status updated", "id": lead_id, "status": update.status}
 
 
 @api_router.delete("/leads/{lead_id}")
-async def delete_lead(lead_id: str):
+async def delete_lead(lead_id: str, current_user: str = Depends(require_auth)):
     """Delete a lead."""
-    result = await db.leads.delete_one({"id": lead_id})
-    if result.deleted_count == 0:
+    result = supabase_request("DELETE", "/leads", params={"id": f"eq.{lead_id}", "select": "*"})
+    if not result:
         raise HTTPException(status_code=404, detail="Lead not found")
     return {"message": "Lead deleted", "id": lead_id}
 
 
 @api_router.get("/leads/stats", response_model=StatsResponse)
-async def get_leads_stats():
+async def get_leads_stats(current_user: str = Depends(require_auth)):
     """Get dashboard statistics."""
-    all_leads = await db.leads.find({}, {"_id": 0, "status": 1, "platform": 1, "score": 1, "potential": 1}).to_list(1000)
-
-    total = len(all_leads)
-    by_status = {}
-    by_platform = {}
-    total_score = 0
-    high = medium = low = 0
-
-    for lead in all_leads:
-        s = lead.get("status", "new")
-        by_status[s] = by_status.get(s, 0) + 1
-
-        p = lead.get("platform", "unknown")
-        by_platform[p] = by_platform.get(p, 0) + 1
-
-        total_score += lead.get("score", 0)
-
-        pot = lead.get("potential", "moyen")
-        if pot == "eleve":
-            high += 1
-        elif pot == "moyen":
-            medium += 1
-        else:
-            low += 1
-
-    return StatsResponse(
-        total=total,
-        by_status=by_status,
-        by_platform=by_platform,
-        avg_score=round(total_score / total, 1) if total > 0 else 0,
-        high_potential=high,
-        medium_potential=medium,
-        low_potential=low
+    all_leads = _supabase_try_list(
+        "GET",
+        "/leads",
+        params={"select": "status,platform,score,potential", "limit": "1000"},
     )
+    if all_leads is None:
+        return _stats_from_leads_rows(list(OFFLINE_LEADS))
+    return _stats_from_leads_rows(all_leads)
 
 
 @api_router.post("/leads/{lead_id}/regenerate-message")
-async def regenerate_message(lead_id: str):
+async def regenerate_message(lead_id: str, current_user: str = Depends(require_auth)):
     """Regenerate the recruitment message for an existing lead."""
-    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
-    if not lead:
+    lead_rows = supabase_request(
+        "GET",
+        "/leads",
+        params={"id": f"eq.{lead_id}", "select": "*", "limit": "1"},
+    )
+    if not lead_rows:
         raise HTTPException(status_code=404, detail="Lead not found")
+    lead = lead_rows[0]
 
     profile = ProfileInput(
         name=lead["name"],
@@ -345,15 +1229,435 @@ async def regenerate_message(lead_id: str):
 
     new_message = await generate_recruitment_message(profile, analysis)
 
-    await db.leads.update_one(
-        {"id": lead_id},
-        {"$set": {"generated_message": new_message}}
+    supabase_request(
+        "PATCH",
+        "/leads",
+        params={"id": f"eq.{lead_id}", "select": "*"},
+        payload={"generated_message": new_message},
     )
 
     return {"message": new_message, "id": lead_id}
 
 
+@api_router.get("/agents", response_model=List[AgentConfigResponse])
+async def list_agents(current_user: str = Depends(require_auth)):
+    rows = _supabase_try_list(
+        "GET",
+        "/agent_configs",
+        params={"select": "*", "order": "created_at.desc", "limit": "200"},
+    )
+    if rows is None:
+        return list(OFFLINE_AGENT_CONFIGS)
+    return rows
+
+
+@api_router.post("/agents", response_model=AgentConfigResponse)
+async def create_agent(data: AgentConfigCreateRequest, current_user: str = Depends(require_auth)):
+    settings = build_agent_settings_from_request(data)
+    payload = {
+        "name": data.name.strip(),
+        "function_type": data.function_type.strip(),
+        "enabled": data.enabled,
+        "settings": settings,
+        "created_by": current_user,
+        "created_at": utc_now_iso(),
+        "updated_at": utc_now_iso(),
+    }
+    rows = _supabase_try_call("POST", "/agent_configs", payload=payload)
+    if rows:
+        return rows[0]
+    row = {"id": str(uuid4()), **payload}
+    return _offline_append_agent_row(row)
+
+
+@api_router.patch("/agents/{agent_id}", response_model=AgentConfigResponse)
+async def update_agent(agent_id: str, data: AgentConfigUpdateRequest, current_user: str = Depends(require_auth)):
+    existing_rows = supabase_request(
+        "GET",
+        "/agent_configs",
+        params={"id": f"eq.{agent_id}", "select": "*", "limit": "1"},
+    )
+    if not existing_rows:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+
+    existing = existing_rows[0]
+    merged_settings = merge_agent_settings(existing.get("settings", {}) or {}, data)
+    update_payload = {"settings": merged_settings, "updated_at": utc_now_iso()}
+    if data.name is not None:
+        update_payload["name"] = data.name.strip()
+    if data.function_type is not None:
+        update_payload["function_type"] = data.function_type.strip()
+    if data.enabled is not None:
+        update_payload["enabled"] = data.enabled
+
+    rows = supabase_request(
+        "PATCH",
+        "/agent_configs",
+        params={"id": f"eq.{agent_id}", "select": "*"},
+        payload=update_payload,
+    )
+    if not rows:
+        raise HTTPException(status_code=500, detail="Failed to update agent.")
+    return rows[0]
+
+
+@api_router.get("/agents/runs", response_model=List[AgentRunRecordResponse])
+async def list_agent_runs(current_user: str = Depends(require_auth)):
+    rows = _supabase_try_list(
+        "GET",
+        "/agent_runs",
+        params={"select": "*", "order": "started_at.desc", "limit": "300"},
+    )
+    source = rows if rows is not None else OFFLINE_AGENT_RUNS
+    normalized = []
+    for row in source:
+        normalized.append({**row, "details": row.get("details") or {}})
+    return normalized
+
+
+@api_router.post("/agents/{agent_id}/run", response_model=AgentRunResponse)
+async def run_named_agent(agent_id: str, current_user: str = Depends(require_auth)):
+    config_rows = supabase_request(
+        "GET",
+        "/agent_configs",
+        params={"id": f"eq.{agent_id}", "select": "*", "limit": "1"},
+    )
+    if not config_rows:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    config = config_rows[0]
+    if not config.get("enabled", True):
+        raise HTTPException(status_code=400, detail="Agent is disabled.")
+
+    settings = config.get("settings") or {}
+    payload = AgentRunRequest(
+        dry_run=bool(settings.get("dry_run", False)),
+        max_profiles=int(settings.get("max_profiles", 25)),
+        discover_youtube=bool(settings.get("discover_youtube", True)),
+        youtube_max_results=int(settings.get("youtube_max_results", 20)),
+    )
+
+    run_record_rows = supabase_request(
+        "POST",
+        "/agent_runs",
+        payload={
+            "agent_id": agent_id,
+            "agent_name": config.get("name", ""),
+            "status": "running",
+            "run_type": config.get("function_type", "recruitment"),
+            "summary": "Agent run started",
+            "details": {},
+            "triggered_by": current_user,
+            "started_at": utc_now_iso(),
+        },
+    )
+    run_record_id = run_record_rows[0]["id"] if run_record_rows else None
+
+    try:
+        result = await execute_agent_cycle(payload)
+        if run_record_id:
+            supabase_request(
+                "PATCH",
+                "/agent_runs",
+                params={"id": f"eq.{run_record_id}", "select": "*"},
+                payload={
+                    "status": "completed",
+                    "summary": result["summary"],
+                    "details": result,
+                    "finished_at": utc_now_iso(),
+                },
+            )
+        return AgentRunResponse(**result)
+    except Exception as e:
+        if run_record_id:
+            supabase_request(
+                "PATCH",
+                "/agent_runs",
+                params={"id": f"eq.{run_record_id}", "select": "*"},
+                payload={
+                    "status": "failed",
+                    "summary": f"Agent failed: {e}",
+                    "details": {"error": str(e)},
+                    "finished_at": utc_now_iso(),
+                },
+            )
+        raise
+
+
+@api_router.post("/agent/run", response_model=AgentRunResponse)
+async def run_agent(payload: AgentRunRequest, current_user: str = Depends(require_auth)):
+    """Run default agent cycle directly from dashboard quick action."""
+    result = await execute_agent_cycle(payload)
+    return AgentRunResponse(**result)
+
+
+@api_router.get("/agent/status", response_model=AgentStatusResponse)
+async def agent_status(current_user: str = Depends(require_auth)):
+    """Estati konfigirasyon agent rekritman kreyòl."""
+    return AgentStatusResponse(
+        openai_configured=bool(OPENAI_API_KEY),
+        youtube_configured=bool(YOUTUBE_API_KEY),
+        apify_configured=bool(os.environ.get("APIFY_API_KEY", "")),
+        resend_configured=bool(os.environ.get("RESEND_API_KEY", "")),
+        smtp_configured=bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD),
+        agent_model=AGENT_LLM_MODEL,
+        categories=list(agent_rc.CATEGORY_HASHTAGS.keys()),
+        message="API pare pou rechèch, analiz, epi voye imèl (si kle yo ranpli).",
+    )
+
+
+@api_router.post("/agent/search", response_model=AgentSearchResponse)
+async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(require_auth)):
+    """Dekouvèt pwofil sou TikTok, YouTube, Facebook, Instagram selon kategori ak hashtags kreyòl."""
+    cat = agent_rc.normalize_category(payload.category)
+    max_r = max(1, min(100, int(payload.max_results or 20)))
+    plats = [p.lower().strip() for p in (payload.platforms or []) if p.strip()]
+    if not plats:
+        raise HTTPException(status_code=400, detail="Chwazi omwen yon platfòm.")
+
+    per = max(1, max_r // len(plats))
+    raw_profiles: List[Dict[str, Any]] = []
+
+    async def safe(coro):
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning("Agent search partial failure: %s", e)
+            return []
+
+    async def youtube_profiles_safe() -> List[Dict[str, Any]]:
+        if "youtube" not in plats:
+            return []
+        try:
+            rows = await asyncio.to_thread(agent_rc.discover_youtube_channels_category, cat, per)
+            out = []
+            for row in rows or []:
+                out.append(
+                    {
+                        "username": row["username"],
+                        "platform": "youtube",
+                        "followers": row.get("followers", 0),
+                        "bio": row.get("bio", ""),
+                        "profile_url": row.get("profile_url", ""),
+                        "snippet": row.get("snippet", ""),
+                    }
+                )
+            return out
+        except Exception as e:
+            logger.warning("YouTube discovery in agent_search: %s", e)
+            return []
+
+    tasks = []
+    if "tiktok" in plats:
+        tasks.append(safe(agent_rc.discover_tiktok_profiles(cat, per)))
+    if "instagram" in plats:
+        tasks.append(safe(agent_rc.discover_instagram_profiles(cat, per)))
+    if "facebook" in plats:
+        tasks.append(safe(agent_rc.discover_facebook_profiles(cat, per)))
+    tasks.append(safe(youtube_profiles_safe()))
+
+    if tasks:
+        parts = await asyncio.gather(*tasks)
+        for part in parts:
+            raw_profiles.extend(part or [])
+
+    # Dedupe username+platform, limite max_r
+    seen: set = set()
+    merged: List[Dict[str, Any]] = []
+    for row in raw_profiles:
+        key = (row.get("platform", "").lower(), (row.get("username") or "").strip().lower())
+        if not key[1]:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+        if len(merged) >= max_r:
+            break
+
+    out: List[AgentProfilePayload] = []
+    for row in merged[:max_r]:
+        bio = (row.get("bio") or "").strip()
+        sn = (row.get("snippet") or "").strip()
+        if sn:
+            bio = (bio + "\n\n" + sn).strip()[:8000]
+        email = agent_rc.extract_email_from_text(bio) or row.get("email")
+        out.append(
+            AgentProfilePayload(
+                id=str(uuid4()),
+                username=(row.get("username") or "unknown")[:500],
+                platform=str(row.get("platform", "tiktok")).lower(),
+                category=cat,
+                followers=int(row.get("followers") or 0),
+                bio=bio,
+                profile_url=(row.get("profile_url") or "")[:2000],
+                email=email,
+                creole_score=0,
+                status="found",
+                created_at=utc_now_iso(),
+            )
+        )
+
+    return AgentSearchResponse(profiles=out, count=len(out))
+
+
+@api_router.post("/agent/analyze", response_model=AgentAnalyzeResponse)
+async def agent_analyze(payload: AgentAnalyzeRequest, current_user: str = Depends(require_auth)):
+    """Analiz kreyòl ak OpenAI; kenbe sèlman score > 70; anrejistre kòm lead si Supabase disponib."""
+    analyze_sem = asyncio.Semaphore(6)
+
+    async def score_one(p: AgentProfilePayload):
+        async with analyze_sem:
+            pd = {
+                "username": p.username,
+                "platform": p.platform,
+                "bio": p.bio or "",
+                "snippet": "",
+                "category": p.category,
+            }
+            hint = await agent_rc.analyze_creole_score(openai_client, AGENT_LLM_MODEL, pd)
+            return p, hint
+
+    scored_pairs = await asyncio.gather(*[score_one(p) for p in payload.profiles])
+
+    results: List[AgentProfilePayload] = []
+    for p, hint in scored_pairs:
+        score = int(hint.get("creole_score") or 0)
+        if score <= 70:
+            continue
+
+        potential = "eleve" if score >= 85 else "moyen"
+        reasoning = (hint.get("reasoning") or "").strip()
+        reasoning = f"[Kreyòl {score}/100] {reasoning}"[:8000]
+
+        content_example = (p.profile_url or "").strip()
+        if p.bio:
+            content_example = (content_example + "\n\n" + p.bio[:3000]).strip() if content_example else p.bio[:4000]
+
+        lead_doc = {
+            "name": p.username[:500],
+            "bio": (p.bio or "")[:8000],
+            "platform": p.platform.lower(),
+            "followers": int(p.followers or 0),
+            "content_example": content_example[:8000] or "—",
+            "email": (p.email or "").strip() or None,
+            "is_educator": True,
+            "domain": agent_rc.normalize_category(p.category),
+            "potential": potential,
+            "score": score,
+            "reasoning": reasoning,
+            "generated_message": "",
+            "status": "new",
+        }
+
+        new_id: Optional[str] = None
+        try:
+            if SUPABASE_URL and SUPABASE_KEY:
+                existing = supabase_request(
+                    "GET",
+                    "/leads",
+                    params={
+                        "select": "id,score",
+                        "platform": f"eq.{lead_doc['platform']}",
+                        "name": f"eq.{lead_doc['name']}",
+                        "limit": "1",
+                    },
+                )
+                if existing:
+                    new_id = existing[0]["id"]
+                    supabase_request(
+                        "PATCH",
+                        "/leads",
+                        params={"id": f"eq.{new_id}", "select": "*"},
+                        payload={
+                            "score": score,
+                            "reasoning": reasoning,
+                            "potential": potential,
+                            "bio": lead_doc["bio"],
+                            "followers": lead_doc["followers"],
+                            "content_example": lead_doc["content_example"],
+                            "email": lead_doc["email"] or existing[0].get("email"),
+                        },
+                    )
+                else:
+                    inserted = supabase_request("POST", "/leads", payload=lead_doc)
+                    new_id = inserted[0]["id"] if inserted else None
+        except Exception as e:
+            logger.warning("Lead save skipped/failed: %s", e)
+            new_id = p.id or str(uuid4())
+
+        results.append(
+            AgentProfilePayload(
+                id=new_id or str(uuid4()),
+                username=p.username,
+                platform=p.platform,
+                category=agent_rc.normalize_category(p.category),
+                followers=int(p.followers or 0),
+                bio=p.bio,
+                profile_url=p.profile_url,
+                email=p.email,
+                creole_score=score,
+                status="analyzed",
+                created_at=p.created_at or utc_now_iso(),
+            )
+        )
+
+    return AgentAnalyzeResponse(profiles=results, count=len(results))
+
+
+@api_router.post("/agent/send-email", response_model=AgentSendEmailResponse)
+async def agent_send_email(payload: AgentSendEmailRequest, current_user: str = Depends(require_auth)):
+    """Jenere imèl an kreyòl epi voye atravè Resend (contact@konektegroup.com). dry_run=true pou previzyalizasyon."""
+    prof = payload.profile
+    to_email = (prof.email or "").strip()
+    if not to_email:
+        raise HTTPException(status_code=400, detail="Pa gen adrès imèl sou pwofil la.")
+
+    draft = await agent_rc.generate_recruitment_email_openai(openai_client, AGENT_LLM_MODEL, prof.model_dump())
+    subject = draft.get("subject") or "KonekteGroup"
+    body = draft.get("body") or ""
+
+    if payload.dry_run:
+        return AgentSendEmailResponse(
+            ok=True,
+            dry_run=True,
+            message="Previzyalizasyon imèl pare.",
+            subject=subject,
+            body=body,
+            resend_id=None,
+        )
+
+    ok, info = agent_rc.send_email_resend(to_email, subject, body)
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"Resend echwe: {info}")
+
+    # Mete ajou lead si id Supabase
+    try:
+        if SUPABASE_URL and SUPABASE_KEY and payload.profile_id:
+            supabase_request(
+                "PATCH",
+                "/leads",
+                params={"id": f"eq.{payload.profile_id}", "select": "*"},
+                payload={
+                    "status": "contacted",
+                    "generated_message": body,
+                    "email": to_email,
+                },
+            )
+    except Exception as e:
+        logger.warning("Could not update lead after email: %s", e)
+
+    return AgentSendEmailResponse(
+        ok=True,
+        dry_run=False,
+        message="Imèl voye ak siksè.",
+        subject=subject,
+        body=body,
+        resend_id=str(info)[:120],
+    )
+
+
 # Include router and middleware
+app.include_router(auth_router)
 app.include_router(api_router)
 
 app.add_middleware(
@@ -364,6 +1668,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+# Serve frontend from FastAPI (single unified app/runtime)
+if FRONTEND_BUILD_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_BUILD_DIR / "static")), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_frontend_root():
+        return FileResponse(str(FRONTEND_BUILD_DIR / "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend_app(full_path: str):
+        if full_path.startswith("api"):
+            raise HTTPException(status_code=404, detail="API route not found")
+        candidate = FRONTEND_BUILD_DIR / full_path
+        if candidate.exists() and candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(FRONTEND_BUILD_DIR / "index.html"))

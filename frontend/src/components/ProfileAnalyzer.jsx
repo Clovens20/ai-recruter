@@ -25,6 +25,7 @@ export const ProfileAnalyzer = ({ onAnalyze }) => {
     platform: "",
     followers: "",
     content_example: "",
+    email: "",
   });
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
@@ -163,18 +164,32 @@ export const ProfileAnalyzer = ({ onAnalyze }) => {
 
               <div className="space-y-2">
                 <Label className="text-[11px] font-semibold tracking-[0.1em] uppercase text-[#94A3B8]">
-                  Exemple de contenu
+                  Email
                 </Label>
                 <Input
-                  data-testid="input-content"
-                  placeholder="Ex: Tutoriels de maths en creole"
-                  value={form.content_example}
-                  onChange={(e) =>
-                    setForm({ ...form, content_example: e.target.value })
-                  }
+                  data-testid="input-email"
+                  type="email"
+                  placeholder="Ex: formateur@email.com"
+                  value={form.email}
+                  onChange={(e) => setForm({ ...form, email: e.target.value })}
                   className={inputCls}
                 />
               </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label className="text-[11px] font-semibold tracking-[0.1em] uppercase text-[#94A3B8]">
+                Exemple de contenu
+              </Label>
+              <Input
+                data-testid="input-content"
+                placeholder="Ex: Tutoriels de maths en creole"
+                value={form.content_example}
+                onChange={(e) =>
+                  setForm({ ...form, content_example: e.target.value })
+                }
+                className={inputCls}
+              />
             </div>
           </div>
 

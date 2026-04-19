@@ -4,10 +4,10 @@
 Build an AI-powered recruitment platform for Konekte Group to automatically recruit teachers, coaches, and educational content creators from the internet.
 
 ## Architecture
-- **Backend**: FastAPI (Python) + MongoDB + emergentintegrations (OpenAI GPT-4o)
+- **Backend**: FastAPI (Python) + Supabase + OpenAI API
 - **Frontend**: React + Shadcn UI + Tailwind CSS (dark theme) + Framer Motion
-- **Database**: MongoDB (with Supabase migration guide ready)
-- **AI**: OpenAI GPT-4o via Emergent LLM key
+- **Database**: Supabase (PostgreSQL)
+- **AI**: OpenAI GPT-4o
 
 ## User Personas
 - Konekte Group recruiters managing educator leads

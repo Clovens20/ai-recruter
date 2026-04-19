@@ -1,12 +1,13 @@
-import { NavLink } from "react-router-dom";
-import { LayoutDashboard, UserSearch, Sparkles } from "lucide-react";
+import { Link, NavLink } from "react-router-dom";
+import { LayoutDashboard, UserSearch, Sparkles, LogOut, Bot } from "lucide-react";
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/analyze", icon: UserSearch, label: "Analyser" },
+  { to: "/agents", icon: Bot, label: "Agents" },
 ];
 
-export const Sidebar = () => {
+export const Sidebar = ({ onLogout }) => {
   return (
     <aside
       data-testid="sidebar"
@@ -56,10 +57,23 @@ export const Sidebar = () => {
 
       {/* Bottom info */}
       <div className="p-4 border-t border-white/[0.08]">
-        <div className="px-3 py-2">
+        <div className="px-3 py-2 space-y-2">
           <p className="text-[11px] text-[#94A3B8]">Konekte Group</p>
           <p className="text-[10px] text-[#64748B]">Agent v1.0</p>
+          <p className="text-[10px] text-[#64748B]">
+            <Link to="/legal/privacy" className="text-blue-400/90 hover:text-blue-300 hover:underline">
+              Legal
+            </Link>
+          </p>
         </div>
+        <button
+          type="button"
+          onClick={onLogout}
+          className="w-full mt-2 flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-[#94A3B8] hover:text-white hover:bg-white/[0.05]"
+        >
+          <LogOut className="w-4 h-4" />
+          Deconnexion
+        </button>
       </div>
     </aside>
   );
