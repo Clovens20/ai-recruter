@@ -52,6 +52,25 @@ CATEGORY_HASHTAGS: Dict[str, List[str]] = {
     "Lòt": ["kreyol", "ayiti", "formasyon", "kreyòl"],
 }
 
+# Hashtags konbine Apify TikTok — pi byen pou pwofil kreyòl ayisyen (POST /api/agent/search)
+HASHTAGS_PAR_CATEGORIE: Dict[str, List[str]] = {
+    "Teknoloji": ["teknoloji", "ayiti", "ayisyen", "kreyol", "haiti", "informatik"],
+    "Marketing Digital": ["maketing", "ayiti", "biznis", "kreyol", "ayisyen"],
+    "AI": ["AI", "ayiti", "teknoloji", "kreyol", "chatgpt"],
+    "Finance": ["finans", "lajan", "ayiti", "kreyol", "ayisyen", "biznis"],
+    "Biznis": ["ayiti", "biznis", "ayisyen", "kreyol", "antrepreneur", "haiti"],
+    "Kreatif": ["kreyatif", "ayiti", "atis", "kreyol", "ayisyen"],
+    "Sante": ["sante", "ayiti", "lasante", "kreyol", "ayisyen"],
+    "Lang": ["lang", "ayiti", "kreyol", "ayisyen", "angle"],
+    "Mizik": ["mizik", "ayiti", "ayisyen", "kreyol", "chante"],
+    "Devlopman Pèsonèl": ["motivasyon", "ayiti", "siksè", "kreyol", "ayisyen"],
+    "Edikasyon": ["edikasyon", "ayiti", "lekol", "kreyol", "ayisyen"],
+    "Travay Atizana": ["atizana", "ayiti", "metye", "kreyol", "ayisyen"],
+    "Lòt": ["ayiti", "ayisyen", "kreyol", "haiti", "haitian"],
+}
+
+TIKTOK_FALLBACK_HASHTAGS: List[str] = ["ayiti", "ayisyen", "kreyol"]
+
 # Requête YouTube (Data API v3) — mo kle + kategori
 YOUTUBE_EXTRA_TERMS = [
     "kreyol ayisyen",
@@ -147,6 +166,68 @@ def tiktok_hashtags_merged(category: str) -> List[str]:
     return out[:APIFY_TIKTOK_HASHTAGS_MAX]
 
 
+def tiktok_hashtags_creole_category(category: str) -> List[str]:
+    """Hashtags konbine pou kategori (HASHTAGS_PAR_CATEGORIE), limit Apify."""
+    cat = normalize_category(category)
+    raw = HASHTAGS_PAR_CATEGORIE.get(cat) or HASHTAGS_PAR_CATEGORIE["Lòt"]
+    out: List[str] = []
+    seen: set = set()
+    for h in raw:
+        t = str(h).strip().lstrip("#").lower()
+        if not t or len(t) < 2 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out[:APIFY_TIKTOK_HASHTAGS_MAX]
+
+
+def normalize_custom_hashtags(tags: Optional[List[str]], max_tags: Optional[int] = None) -> List[str]:
+    """Hashtags itilizatè (TikTok / Instagram / Facebook) — miniskil, san #, limit pou Apify."""
+    cap = max_tags if max_tags is not None else APIFY_TIKTOK_HASHTAGS_MAX
+    cap = max(1, min(40, cap))
+    if not tags:
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for h in tags:
+        if h is None:
+            continue
+        t = str(h).strip().lstrip("#").lower()
+        if not t or len(t) < 2 or len(t) > 80 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def youtube_agent_search_queries(category: str) -> List[str]:
+    """Requètes YouTube pou POST /api/agent/search (kreyòl / Ayiti)."""
+    cat = normalize_category(category)
+    # Requèt priyoritè: "{kategori} ayiti kreyol" (egzanp: biznis ayiti kreyol)
+    primary = f"{cat.lower()} ayiti kreyol"
+    rest = [
+        f"{cat} kreyol ayisyen",
+        f"{cat} ayiti",
+        "ayiti " + cat,
+        "kreyol " + cat,
+        "haitian " + cat,
+    ]
+    seen: set = set()
+    out: List[str] = []
+    for q in [primary] + rest:
+        qn = (q or "").strip()
+        if not qn:
+            continue
+        k = qn.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(qn)
+    return out
+
+
 def _apify_run_sync(actor_id: str, run_input: Dict[str, Any], timeout_secs: Optional[int] = None) -> List[Dict[str, Any]]:
     if timeout_secs is None:
         timeout_secs = APIFY_WAIT_SECS
@@ -164,9 +245,12 @@ def _apify_run_sync(actor_id: str, run_input: Dict[str, Any], timeout_secs: Opti
         out: List[Dict[str, Any]] = []
         for item in client.dataset(did).iterate_items():
             out.append(item)
+        print(f"[apify] actor={actor_id} dataset_items={len(out)}", flush=True)
+        logger.info("Apify actor %s fini: %s atik nan dataset", actor_id, len(out))
         return out
     except Exception as e:
         logger.exception("Apify actor %s echwe: %s", actor_id, e)
+        print(f"[apify] actor={actor_id} ERREUR: {e}", flush=True)
         return []
 
 
@@ -184,9 +268,13 @@ def _tiktok_parse_author(item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     uid = (
         (author.get("uniqueId") or author.get("unique_id") or "").strip()
         or (item.get("authorId") or item.get("author_id") or "").strip()
+        or (item.get("uniqueId") or item.get("unique_id") or "").strip()
+        or (item.get("authorSecUid") or "").strip()
     )
     nick = (
         (author.get("name") or author.get("nickname") or item.get("nickname") or "").strip()
+        or (item.get("authorName") or item.get("author_name") or "").strip()
+        or (item.get("nickname") or "").strip()
         or uid
     )
     if not uid and not nick:
@@ -196,36 +284,10 @@ def _tiktok_parse_author(item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     return (url_id, display)
 
 
-async def discover_tiktok_profiles(category: str, max_results: int) -> List[Dict[str, Any]]:
-    """
-    Yon sèl run Apify ak anpil hashtags (pa yon hashtag a la fwa).
-    Si 0 rezilta: verifye APIFY_API_KEY, kredi Apify, oswa hashtags twò espesifik.
-    """
-    hashtags = tiktok_hashtags_merged(category)
-    if not hashtags:
-        return []
-    results_per_page = min(
-        APIFY_TIKTOK_RESULTS_PER_PAGE,
-        max(20, min(APIFY_TIKTOK_RESULTS_CAP, max_results * 3, 80)),
-    )
-    items = await apify_run(
-        APIFY_TIKTOK_ACTOR,
-        {
-            "hashtags": hashtags,
-            "resultsPerPage": results_per_page,
-            "shouldDownloadVideos": False,
-            "shouldDownloadCovers": False,
-        },
-    )
-    if not items:
-        logger.warning(
-            "TikTok Apify retounen 0 atik (hashtags=%s). Tcheke kle Apify ak actor %s.",
-            hashtags[:8],
-            APIFY_TIKTOK_ACTOR,
-        )
+def _tiktok_items_to_profiles(items: List[Dict[str, Any]], max_results: int) -> List[Dict[str, Any]]:
     profiles: List[Dict[str, Any]] = []
     seen: set = set()
-    for item in items:
+    for item in items or []:
         parsed = _tiktok_parse_author(item)
         if not parsed:
             continue
@@ -254,8 +316,75 @@ async def discover_tiktok_profiles(category: str, max_results: int) -> List[Dict
     return profiles
 
 
-async def discover_instagram_profiles(category: str, max_results: int) -> List[Dict[str, Any]]:
-    hashtags = [h.lstrip("#") for h in hashtags_for_category(category)[:4]]
+async def discover_tiktok_profiles(
+    category: str, max_results: int, custom_hashtags: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Yon sèl run Apify ak hashtags konbine kreyòl / Ayiti pa kategori,
+    oswa `custom_hashtags` si itilizatè voye yo (POST /api/agent/search).
+    Si 0 pwofil: dezyèm run ak hashtags fallback (ayiti, ayisyen, kreyol).
+    """
+    if custom_hashtags:
+        hashtags_primary = normalize_custom_hashtags(custom_hashtags)
+    else:
+        hashtags_primary = tiktok_hashtags_creole_category(category)
+    if not hashtags_primary:
+        return []
+    results_per_page = min(
+        APIFY_TIKTOK_RESULTS_PER_PAGE,
+        max(20, min(APIFY_TIKTOK_RESULTS_CAP, max_results * 3, 80)),
+    )
+    # Champs souvan rekòmande pa clockworks/tiktok-scraper (proxyCountryCode, excludePinnedPosts)
+    run_input_base: Dict[str, Any] = {
+        "hashtags": hashtags_primary,
+        "resultsPerPage": results_per_page,
+        "shouldDownloadVideos": False,
+        "shouldDownloadCovers": False,
+        "shouldDownloadAvatars": False,
+        "excludePinnedPosts": False,
+        "scrapeRelatedVideos": False,
+        "proxyCountryCode": os.environ.get("APIFY_TIKTOK_PROXY_COUNTRY", "None"),
+    }
+
+    print(
+        f"[tiktok] actor={APIFY_TIKTOK_ACTOR} hashtags={hashtags_primary!r} resultsPerPage={results_per_page}",
+        flush=True,
+    )
+    items = await apify_run(
+        APIFY_TIKTOK_ACTOR,
+        run_input_base,
+    )
+    print(f"[tiktok] items_brut={len(items or [])}", flush=True)
+    if not items:
+        logger.warning(
+            "TikTok Apify retounen 0 atik (hashtags=%s). Tcheke kle Apify ak actor %s.",
+            hashtags_primary[:8],
+            APIFY_TIKTOK_ACTOR,
+        )
+    profiles = _tiktok_items_to_profiles(items, max_results)
+    print(f"[tiktok] profiles_parse={len(profiles)}", flush=True)
+
+    primary_set = frozenset(h.lower() for h in hashtags_primary)
+    fallback_set = frozenset(h.lower() for h in TIKTOK_FALLBACK_HASHTAGS)
+    if not profiles and primary_set != fallback_set:
+        logger.info("TikTok: 0 pwofil ak hashtags kategori — esè fallback %s", TIKTOK_FALLBACK_HASHTAGS)
+        fb_input = dict(run_input_base)
+        fb_input["hashtags"] = list(TIKTOK_FALLBACK_HASHTAGS)
+        items_fb = await apify_run(APIFY_TIKTOK_ACTOR, fb_input)
+        profiles = _tiktok_items_to_profiles(items_fb, max_results)
+
+    return profiles
+
+
+async def discover_instagram_profiles(
+    category: str, max_results: int, custom_hashtags: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    if custom_hashtags:
+        hashtags = normalize_custom_hashtags(custom_hashtags, max_tags=8)
+    else:
+        hashtags = [h.lstrip("#") for h in hashtags_for_category(category)[:4]]
+    if not hashtags:
+        hashtags = [h.lstrip("#") for h in hashtags_for_category(category)[:4]]
     items = await apify_run(
         APIFY_INSTAGRAM_ACTOR,
         {
@@ -289,8 +418,15 @@ async def discover_instagram_profiles(category: str, max_results: int) -> List[D
     return profiles
 
 
-async def discover_facebook_profiles(category: str, max_results: int) -> List[Dict[str, Any]]:
-    tags = hashtags_for_category(category)[:2]
+async def discover_facebook_profiles(
+    category: str, max_results: int, custom_hashtags: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    if custom_hashtags:
+        tags = normalize_custom_hashtags(custom_hashtags, max_tags=4)
+    else:
+        tags = hashtags_for_category(category)[:2]
+    if not tags:
+        tags = hashtags_for_category(normalize_category(category))[:2]
     queries = [f"{t} kreyol ayiti" for t in tags]
     items = await apify_run(
         APIFY_FACEBOOK_ACTOR,
@@ -451,6 +587,38 @@ async def discover_youtube_channels_category_async(category: str, max_results: i
         discovered.extend(p or [])
     deduped = _dedupe_youtube_channels(discovered)
     deduped.sort(key=lambda x: int(x.get("followers") or 0), reverse=True)
+    return deduped[:max_results]
+
+
+async def discover_youtube_agent_search_async(
+    category: str, max_results: int, extra_hashtags: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """YouTube pou POST /api/agent/search — requètes kreyòl / Ayiti an paralèl."""
+    if not YOUTUBE_API_KEY:
+        print("[youtube/search] YOUTUBE_API_KEY manke", flush=True)
+        return []
+    queries = list(youtube_agent_search_queries(category))
+    print(f"[youtube/search] queries={queries[:6]!r}... (total {len(queries)})", flush=True)
+    if extra_hashtags:
+        seen_q = {q.lower() for q in queries}
+        for h in normalize_custom_hashtags(extra_hashtags, max_tags=8)[:5]:
+            q = f"{h} kreyol ayisyen"
+            lk = q.lower()
+            if lk not in seen_q:
+                seen_q.add(lk)
+                queries.append(q)
+    per_q = max(2, min(15, max(3, max_results * 2 // max(1, len(queries)))))
+    tasks = [asyncio.to_thread(_youtube_search_channels_one_query, q, per_q) for q in queries]
+    parts = await asyncio.gather(*tasks, return_exceptions=True)
+    discovered: List[Dict[str, Any]] = []
+    for p in parts:
+        if isinstance(p, Exception):
+            logger.warning("YouTube agent search async: %s", p)
+            continue
+        discovered.extend(p or [])
+    deduped = _dedupe_youtube_channels(discovered)
+    deduped.sort(key=lambda x: int(x.get("followers") or 0), reverse=True)
+    print(f"[youtube/search] queries={len(queries)} kanaal={len(deduped)}", flush=True)
     return deduped[:max_results]
 
 

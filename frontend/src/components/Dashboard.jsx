@@ -73,6 +73,9 @@ export const Dashboard = () => {
         dry_run: false,
         max_profiles: 25,
         discover_youtube: true,
+        discover_tiktok: true,
+        discover_instagram: true,
+        discover_facebook: true,
         youtube_max_results: 20,
       });
       await fetchData();

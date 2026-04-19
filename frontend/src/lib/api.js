@@ -36,8 +36,11 @@ api.interceptors.response.use(
 export const fetchPublicHealth = () => api.get("/health").then((r) => r.data);
 export const fetchSupabaseHealth = () => api.get("/health/supabase").then((r) => r.data);
 
-export const searchProfiles = (category, platforms, maxResults = 20) =>
-  api.post("/agent/search", { category, platforms, max_results: maxResults }).then((r) => r.data);
+export const searchProfiles = (category, platforms, maxResults = 20, hashtags) => {
+  const body = { category, platforms, max_results: maxResults };
+  if (Array.isArray(hashtags) && hashtags.length) body.hashtags = hashtags;
+  return api.post("/agent/search", body).then((r) => r.data);
+};
 
 export const analyzeProfiles = (profiles) =>
   api.post("/agent/analyze", { profiles }).then((r) => r.data);

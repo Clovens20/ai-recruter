@@ -12,7 +12,7 @@ import re
 import smtplib
 import time
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional, Dict, Any
 from openai import AsyncOpenAI
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -391,6 +391,9 @@ def build_agent_settings_from_request(data) -> Dict[str, Any]:
         "dry_run": data.dry_run,
         "max_profiles": data.max_profiles,
         "discover_youtube": data.discover_youtube,
+        "discover_tiktok": data.discover_tiktok,
+        "discover_instagram": data.discover_instagram,
+        "discover_facebook": data.discover_facebook,
         "youtube_max_results": data.youtube_max_results,
     }
 
@@ -403,6 +406,12 @@ def merge_agent_settings(current: Dict[str, Any], update) -> Dict[str, Any]:
         merged["max_profiles"] = update.max_profiles
     if update.discover_youtube is not None:
         merged["discover_youtube"] = update.discover_youtube
+    if update.discover_tiktok is not None:
+        merged["discover_tiktok"] = update.discover_tiktok
+    if update.discover_instagram is not None:
+        merged["discover_instagram"] = update.discover_instagram
+    if update.discover_facebook is not None:
+        merged["discover_facebook"] = update.discover_facebook
     if update.youtube_max_results is not None:
         merged["youtube_max_results"] = update.youtube_max_results
     return merged
@@ -551,6 +560,9 @@ class AgentRunRequest(BaseModel):
     dry_run: bool = False
     max_profiles: int = 25
     discover_youtube: bool = True
+    discover_tiktok: bool = True
+    discover_instagram: bool = True
+    discover_facebook: bool = True
     youtube_max_results: int = 20
 
 
@@ -562,6 +574,7 @@ class AgentRunResponse(BaseModel):
     emailed: int
     dry_run: bool
     summary: str
+    discovery_by_platform: Dict[str, int] = Field(default_factory=dict)
 
 
 class AgentConfigCreateRequest(BaseModel):
@@ -571,6 +584,9 @@ class AgentConfigCreateRequest(BaseModel):
     dry_run: bool = False
     max_profiles: int = 25
     discover_youtube: bool = True
+    discover_tiktok: bool = True
+    discover_instagram: bool = True
+    discover_facebook: bool = True
     youtube_max_results: int = 20
 
 
@@ -581,6 +597,9 @@ class AgentConfigUpdateRequest(BaseModel):
     dry_run: Optional[bool] = None
     max_profiles: Optional[int] = None
     discover_youtube: Optional[bool] = None
+    discover_tiktok: Optional[bool] = None
+    discover_instagram: Optional[bool] = None
+    discover_facebook: Optional[bool] = None
     youtube_max_results: Optional[int] = None
 
 
@@ -630,6 +649,7 @@ class AgentSearchRequest(BaseModel):
     category: str
     platforms: List[str]
     max_results: int = 20
+    hashtags: Optional[List[str]] = None
 
 
 class AgentSearchResponse(BaseModel):
@@ -639,6 +659,8 @@ class AgentSearchResponse(BaseModel):
 
 class AgentAnalyzeRequest(BaseModel):
     profiles: List[AgentProfilePayload]
+    # 0 = pa filtre sou score kreyòl (retounen tout pwofil analize). Default 70 = ansyen konpòtman.
+    min_creole_score: int = Field(default=70, ge=0, le=100)
 
 
 class AgentAnalyzeResponse(BaseModel):
@@ -670,6 +692,7 @@ class AgentStatusResponse(BaseModel):
     agent_model: str
     categories: List[str]
     message: str
+    hashtag_suggestions: Dict[str, List[str]] = Field(default_factory=dict)
 
 # ─── AI Service ───────────────────────────────────────────────────────────────
 
@@ -1148,27 +1171,116 @@ def _youtube_discovery_rows_to_lead_profiles(rows: List[Dict[str, Any]]) -> List
     return out
 
 
+def _agent_discovery_category() -> str:
+    raw = (
+        (os.environ.get("AGENT_DISCOVERY_CATEGORY") or os.environ.get("AGENT_YOUTUBE_CATEGORY") or "Edikasyon").strip()
+        or "Edikasyon"
+    )
+    return agent_rc.normalize_category(raw)
+
+
+def _social_discovery_row_to_lead(row: Dict[str, Any]) -> Optional[dict]:
+    name = (row.get("username") or row.get("name") or "").strip()
+    if not name:
+        return None
+    plat = str(row.get("platform", "tiktok")).lower().strip()
+    bio = (row.get("bio") or "")[:2000]
+    sn = (row.get("snippet") or "")[:500]
+    combined = f"{bio}\n{sn}"
+    ce = (sn or bio[:200] or f"Kontni {plat}.").strip()
+    return {
+        "name": name[:500],
+        "bio": bio,
+        "platform": plat,
+        "followers": int(row.get("followers") or 0),
+        "content_example": ce,
+        "email": agent_rc.extract_email_from_text(combined) or row.get("email"),
+    }
+
+
+def _dedupe_lead_candidates(leads: List[dict]) -> List[dict]:
+    seen: set = set()
+    out: List[dict] = []
+    for L in leads:
+        plat = str(L.get("platform") or "").lower().strip()
+        nm = (L.get("name") or "").strip().lower()
+        if not nm:
+            continue
+        key = (plat, nm)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(L)
+    return out
+
+
 async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
     """Execute one full discovery + outreach cycle and return metrics."""
     run_id = str(uuid4())
     project_context = fetch_project_context()
     discovered_count = 0
+    cat = _agent_discovery_category()
+    per = max(5, min(50, int(payload.youtube_max_results)))
+    discovery_snap: Dict[str, int] = {}
 
+    async def safe_disc(coro):
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning("Agent discovery partial failure: %s", e)
+            return None
+
+    async def run_youtube_bundle():
+        rows = await agent_rc.discover_youtube_agent_search_async(cat, per, None)
+        leads = _youtube_discovery_rows_to_lead_profiles(rows)
+        return "youtube", len(leads), leads
+
+    async def run_tiktok_bundle():
+        raw = await agent_rc.discover_tiktok_profiles(cat, per, None)
+        leads = [x for x in (_social_discovery_row_to_lead(r) for r in (raw or [])) if x]
+        return "tiktok", len(leads), leads
+
+    async def run_instagram_bundle():
+        raw = await agent_rc.discover_instagram_profiles(cat, per, None)
+        leads = [x for x in (_social_discovery_row_to_lead(r) for r in (raw or [])) if x]
+        return "instagram", len(leads), leads
+
+    async def run_facebook_bundle():
+        raw = await agent_rc.discover_facebook_profiles(cat, per, None)
+        leads = [x for x in (_social_discovery_row_to_lead(r) for r in (raw or [])) if x]
+        return "facebook", len(leads), leads
+
+    tasks = []
     if payload.discover_youtube:
-        max_yt = max(1, min(payload.youtube_max_results, 100))
-        cat = agent_rc.normalize_category(os.environ.get("AGENT_YOUTUBE_CATEGORY", "Edikasyon").strip() or "Edikasyon")
-        yt_rows = await agent_rc.discover_youtube_channels_category_async(cat, max_yt)
-        youtube_profiles = _youtube_discovery_rows_to_lead_profiles(yt_rows)
-        if not youtube_profiles and not YOUTUBE_API_KEY:
+        tasks.append(safe_disc(run_youtube_bundle()))
+    if payload.discover_tiktok:
+        tasks.append(safe_disc(run_tiktok_bundle()))
+    if payload.discover_instagram:
+        tasks.append(safe_disc(run_instagram_bundle()))
+    if payload.discover_facebook:
+        tasks.append(safe_disc(run_facebook_bundle()))
+
+    merged_leads: List[dict] = []
+    for res in (await asyncio.gather(*tasks) if tasks else []):
+        if not res:
+            continue
+        plat, nlead, leads = res
+        discovery_snap[plat] = nlead
+        merged_leads.extend(leads)
+
+    if payload.discover_youtube and discovery_snap.get("youtube", -1) == 0:
+        if not YOUTUBE_API_KEY:
             logger.warning(
                 "Cycle agent: YOUTUBE_API_KEY manke — 0 pwofil YouTube. Mete kle nan .env epi aktive YouTube Data API v3."
             )
-        elif not youtube_profiles and YOUTUBE_API_KEY:
+        else:
             logger.warning(
                 "Cycle agent: YouTube retounen 0 kanaal (kategori=%s). Verifye quota / erè API nan konsol Google Cloud.",
                 cat,
             )
-        discovered_count = await upsert_discovered_profiles(youtube_profiles, dry_run=payload.dry_run)
+
+    deduped = _dedupe_lead_candidates(merged_leads)
+    discovered_count = await upsert_discovered_profiles(deduped, dry_run=payload.dry_run)
 
     params = {
         "select": "id,name,bio,platform,followers,content_example,email,domain,potential,score,status",
@@ -1214,8 +1326,38 @@ async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
                             break
 
     hints: List[str] = []
-    if payload.discover_youtube and discovered_count == 0:
-        hints.append("YouTube: verifye YOUTUBE_API_KEY + API YouTube Data aktive (Google Cloud)")
+    if payload.discover_youtube:
+        yt_candidates = discovery_snap.get("youtube", 0)
+        if not YOUTUBE_API_KEY:
+            hints.append(
+                "YouTube: YOUTUBE_API_KEY manke nan backend/.env — mete la epi aktive YouTube Data API v3 (Google Cloud)"
+            )
+        elif yt_candidates == 0:
+            hints.append(
+                "YouTube: 0 kanaal jwenn — verifye quota / restriksyon kle la, oswa ogmante youtube_max_results nan konfig agent la"
+            )
+        elif discovered_count == 0 and not payload.dry_run and yt_candidates > 0:
+            hints.append(
+                f"YouTube: {yt_candidates} kanaal tente men 0 nouvo lead — yo ka deja nan tab Leads (menm non + platfòm)."
+            )
+    apify_key = bool(os.environ.get("APIFY_API_KEY", ""))
+    any_social = payload.discover_tiktok or payload.discover_instagram or payload.discover_facebook
+    if any_social and not apify_key:
+        hints.append("Apify: APIFY_API_KEY manke — TikTok / Instagram / Facebook ap retounen 0 pwofil")
+    if apify_key and any_social:
+        apify_total = sum(discovery_snap.get(p, 0) for p in ("tiktok", "instagram", "facebook"))
+        if apify_total == 0:
+            hints.append(
+                "Apify: 0 pwofil sosyal — verifye kredi Apify, timeout actor, oswa AGENT_DISCOVERY_CATEGORY nan .env"
+            )
+    if deduped and discovered_count == 0 and not payload.dry_run:
+        hints.append(
+            f"Dekouvèt: {len(deduped)} pwofil inik men 0 nouvo lead — yo ka deja nan tab Leads (menm non + platfòm)."
+        )
+    elif not deduped and (payload.discover_youtube or any_social):
+        hints.append(
+            "Dekouvèt: 0 pwofil nan tout sous aktif — verifye kle API, kategori (.env AGENT_DISCOVERY_CATEGORY), epi eseye ankò."
+        )
     if scanned > 0 and not selected_rows:
         hints.append(
             "Seleksyon: sèlman leads ak imel + potential moyen/eleve — anpil chaèn YouTube pa gen imel nan bio"
@@ -1223,10 +1365,13 @@ async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
     if not payload.dry_run and scanned > 0 and not selected_rows:
         hints.append("SMTP: konfigire SMTP_* pou voye imel lè gen lead ki kalifye")
     hint_txt = (" " + " · ".join(hints)) if hints else ""
+    snap_txt = ""
+    if discovery_snap:
+        snap_txt = " Kandida pa platfòm: " + ", ".join(f"{k}={v}" for k, v in sorted(discovery_snap.items()))
 
     summary = (
         f"Run {run_id}: {discovered_count} nouvo pwofil dekouvri, {scanned} pwofil analize, "
-        f"{len(selected_rows)} pwofil seleksyone, {emailed if not payload.dry_run else 0} imel voye.{hint_txt}"
+        f"{len(selected_rows)} pwofil seleksyone, {emailed if not payload.dry_run else 0} imel voye.{snap_txt}{hint_txt}"
     )
     return {
         "run_id": run_id,
@@ -1236,6 +1381,7 @@ async def execute_agent_cycle(payload: AgentRunRequest) -> Dict[str, Any]:
         "emailed": 0 if payload.dry_run else emailed,
         "dry_run": payload.dry_run,
         "summary": summary,
+        "discovery_by_platform": discovery_snap,
     }
 
 
@@ -1593,6 +1739,9 @@ async def run_named_agent(agent_id: str, current_user: str = Depends(require_aut
         dry_run=bool(settings.get("dry_run", False)),
         max_profiles=int(settings.get("max_profiles", 25)),
         discover_youtube=bool(settings.get("discover_youtube", True)),
+        discover_tiktok=bool(settings.get("discover_tiktok", True)),
+        discover_instagram=bool(settings.get("discover_instagram", True)),
+        discover_facebook=bool(settings.get("discover_facebook", True)),
         youtube_max_results=int(settings.get("youtube_max_results", 20)),
     )
 
@@ -1667,19 +1816,39 @@ async def agent_status(current_user: str = Depends(require_auth)):
         agent_model=AGENT_LLM_MODEL,
         categories=list(agent_rc.CATEGORY_HASHTAGS.keys()),
         message="API pare pou rechèch, analiz, epi voye imèl (si kle yo ranpli).",
+        hashtag_suggestions={k: list(v) for k, v in agent_rc.HASHTAGS_PAR_CATEGORIE.items()},
     )
+
+
+def _agent_search_diag(msg: str) -> None:
+    """Logs visib sou Koyeb / stdout (print) + logger."""
+    line = f"[agent/search] {msg}"
+    print(line, flush=True)
+    logger.info("%s", line)
 
 
 @api_router.post("/agent/search", response_model=AgentSearchResponse)
 async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(require_auth)):
     """Dekouvèt pwofil sou TikTok, YouTube, Facebook, Instagram selon kategori ak hashtags kreyòl."""
+    _agent_search_diag(f"debut user={current_user!r} category={payload.category!r} platforms={payload.platforms!r}")
     cat = agent_rc.normalize_category(payload.category)
     max_r = max(1, min(100, int(payload.max_results or 20)))
     plats = [p.lower().strip() for p in (payload.platforms or []) if p.strip()]
     if not plats:
         raise HTTPException(status_code=400, detail="Chwazi omwen yon platfòm.")
 
-    per = max(1, max_r // len(plats))
+    custom_ht: Optional[List[str]] = None
+    if payload.hashtags:
+        custom_ht = agent_rc.normalize_custom_hashtags(payload.hashtags)
+        if not custom_ht:
+            custom_ht = None
+
+    # Plis kandida pa sous anvan dedup username (anpil platfòm = mwens pa youn)
+    per = max(8, max(1, max_r // max(1, len(plats))))
+    _agent_search_diag(
+        f"cle: YOUTUBE={'oui' if bool(YOUTUBE_API_KEY) else 'non'} APIFY={'oui' if bool(os.environ.get('APIFY_API_KEY', '')) else 'non'} "
+        f"actor_tiktok={agent_rc.APIFY_TIKTOK_ACTOR!r} category_norm={cat!r} max_results={max_r} per_plat={per} hashtags_custom={bool(custom_ht)}"
+    )
     raw_profiles: List[Dict[str, Any]] = []
 
     async def safe(coro):
@@ -1693,12 +1862,13 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
         if "youtube" not in plats:
             return []
         try:
-            rows = await agent_rc.discover_youtube_channels_category_async(cat, per)
+            rows = await agent_rc.discover_youtube_agent_search_async(cat, per, custom_ht)
             out = []
             for row in rows or []:
+                uname = (row.get("username") or row.get("name") or "YouTube").strip() or "YouTube"
                 out.append(
                     {
-                        "username": row["username"],
+                        "username": uname,
                         "platform": "youtube",
                         "followers": row.get("followers", 0),
                         "bio": row.get("bio", ""),
@@ -1711,33 +1881,40 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
             logger.warning("YouTube discovery in agent_search: %s", e)
             return []
 
+    # TikTok + YouTube (ak lòt platfòm si chwazi) — asyncio.gather pou paralèl
     tasks = []
     if "tiktok" in plats:
-        tasks.append(safe(agent_rc.discover_tiktok_profiles(cat, per)))
+        tasks.append(safe(agent_rc.discover_tiktok_profiles(cat, per, custom_ht)))
+    if "youtube" in plats:
+        tasks.append(safe(youtube_profiles_safe()))
     if "instagram" in plats:
-        tasks.append(safe(agent_rc.discover_instagram_profiles(cat, per)))
+        tasks.append(safe(agent_rc.discover_instagram_profiles(cat, per, custom_ht)))
     if "facebook" in plats:
-        tasks.append(safe(agent_rc.discover_facebook_profiles(cat, per)))
-    tasks.append(safe(youtube_profiles_safe()))
-
+        tasks.append(safe(agent_rc.discover_facebook_profiles(cat, per, custom_ht)))
     if tasks:
         parts = await asyncio.gather(*tasks)
-        for part in parts:
+        for i, part in enumerate(parts):
+            n = len(part or [])
+            _agent_search_diag(f"gather task#{i} retounen {n} pwofil (brut)")
             raw_profiles.extend(part or [])
 
-    # Dedupe username+platform, limite max_r
+    _agent_search_diag(f"total brut apre gather: {len(raw_profiles)}")
+
+    # Dedupe pa username sèlman (tout platfòm), limite max_r
     seen: set = set()
     merged: List[Dict[str, Any]] = []
     for row in raw_profiles:
-        key = (row.get("platform", "").lower(), (row.get("username") or "").strip().lower())
-        if not key[1]:
+        name_key = (row.get("username") or "").strip().lower()
+        if not name_key:
             continue
-        if key in seen:
+        if name_key in seen:
             continue
-        seen.add(key)
+        seen.add(name_key)
         merged.append(row)
         if len(merged) >= max_r:
             break
+
+    _agent_search_diag(f"apre dedup username: {len(merged)} (limite max_r={max_r})")
 
     out: List[AgentProfilePayload] = []
     for row in merged[:max_r]:
@@ -1762,12 +1939,13 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
             )
         )
 
+    _agent_search_diag(f"fin: count={len(out)} (pa filtre kreyòl — creole_score=0)")
     return AgentSearchResponse(profiles=out, count=len(out))
 
 
 @api_router.post("/agent/analyze", response_model=AgentAnalyzeResponse)
 async def agent_analyze(payload: AgentAnalyzeRequest, current_user: str = Depends(require_auth)):
-    """Analiz kreyòl ak OpenAI; kenbe sèlman score > 70; anrejistre kòm lead si Supabase disponib."""
+    """Analiz kreyòl ak OpenAI; filtre sou min_creole_score (default 70). Mete min_creole_score=0 pou tout retounen."""
     analyze_sem = asyncio.Semaphore(6)
 
     async def score_one(p: AgentProfilePayload):
@@ -1784,10 +1962,11 @@ async def agent_analyze(payload: AgentAnalyzeRequest, current_user: str = Depend
 
     scored_pairs = await asyncio.gather(*[score_one(p) for p in payload.profiles])
 
+    min_sc = max(0, min(100, int(payload.min_creole_score)))
     results: List[AgentProfilePayload] = []
     for p, hint in scored_pairs:
         score = int(hint.get("creole_score") or 0)
-        if score <= 70:
+        if min_sc > 0 and score <= min_sc:
             continue
 
         potential = "eleve" if score >= 85 else "moyen"

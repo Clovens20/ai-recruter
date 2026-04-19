@@ -41,6 +41,9 @@ const defaultCreate = {
   dry_run: false,
   max_profiles: 25,
   discover_youtube: true,
+  discover_tiktok: true,
+  discover_instagram: true,
+  discover_facebook: true,
   youtube_max_results: 20,
 };
 
@@ -77,6 +80,8 @@ export const AgentsCenter = () => {
     facebook: false,
   });
   const [maxSearchResults, setMaxSearchResults] = useState(10);
+  const [hashtagInput, setHashtagInput] = useState("");
+  const [searchHashtags, setSearchHashtags] = useState([]);
   const [discoveredProfiles, setDiscoveredProfiles] = useState([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const [analyzeBusy, setAnalyzeBusy] = useState(false);
@@ -142,6 +147,47 @@ export const AgentsCenter = () => {
   const selectedPlatformIds = () =>
     PLATFORM_OPTIONS.filter((o) => platformsPick[o.id]).map((o) => o.id);
 
+  const addHashtagsFromInput = () => {
+    const parts = hashtagInput
+      .split(/[\s,;]+/)
+      .map((s) => s.trim().replace(/^#/, ""))
+      .filter(Boolean);
+    if (!parts.length) return;
+    setSearchHashtags((prev) => {
+      const seen = new Set(prev.map((x) => x.toLowerCase()));
+      const next = [...prev];
+      for (const p of parts) {
+        const k = p.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        next.push(p);
+      }
+      return next;
+    });
+    setHashtagInput("");
+  };
+
+  const applyCategoryHashtagSuggestions = () => {
+    const sug = agentApiStatus?.hashtag_suggestions?.[searchCategory];
+    if (!Array.isArray(sug) || !sug.length) {
+      window.alert("Pa gen sijesyon hashtag pou kategori sa a (tcheke stati API).");
+      return;
+    }
+    setSearchHashtags((prev) => {
+      const seen = new Set(prev.map((x) => x.toLowerCase()));
+      const next = [...prev];
+      for (const p of sug) {
+        const t = String(p).trim().replace(/^#/, "");
+        if (!t) continue;
+        const k = t.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        next.push(t);
+      }
+      return next;
+    });
+  };
+
   const onRunMultiSearch = async () => {
     const plats = selectedPlatformIds();
     if (plats.length === 0) {
@@ -150,7 +196,12 @@ export const AgentsCenter = () => {
     }
     setSearchBusy(true);
     try {
-      const data = await searchProfiles(searchCategory, plats, maxSearchResults);
+      const data = await searchProfiles(
+        searchCategory,
+        plats,
+        maxSearchResults,
+        searchHashtags.length ? searchHashtags : undefined
+      );
       setDiscoveredProfiles(data.profiles || []);
       window.alert(`Jwenn ${data.count ?? 0} pwofil.`);
     } catch (err) {
@@ -186,6 +237,9 @@ export const AgentsCenter = () => {
       dry_run: Boolean(selectedAgent.settings?.dry_run),
       max_profiles: Number(selectedAgent.settings?.max_profiles || 25),
       discover_youtube: Boolean(selectedAgent.settings?.discover_youtube ?? true),
+      discover_tiktok: Boolean(selectedAgent.settings?.discover_tiktok ?? true),
+      discover_instagram: Boolean(selectedAgent.settings?.discover_instagram ?? true),
+      discover_facebook: Boolean(selectedAgent.settings?.discover_facebook ?? true),
       youtube_max_results: Number(selectedAgent.settings?.youtube_max_results || 20),
     });
   }, [selectedAgent]);
@@ -315,7 +369,7 @@ export const AgentsCenter = () => {
               <Input type="number" value={createForm.max_profiles} onChange={(e) => setCreateForm((p) => ({ ...p, max_profiles: Number(e.target.value || 0) }))} />
             </div>
             <div className="space-y-2">
-              <Label className="text-[#94A3B8]">YouTube max results</Label>
+              <Label className="text-[#94A3B8]">Max rezilta pa platfòm (dekouvèt)</Label>
               <Input type="number" value={createForm.youtube_max_results} onChange={(e) => setCreateForm((p) => ({ ...p, youtube_max_results: Number(e.target.value || 0) }))} />
             </div>
             <div className="space-y-2">
@@ -330,10 +384,22 @@ export const AgentsCenter = () => {
               </select>
             </div>
           </div>
-          <div className="flex gap-4 text-sm text-[#94A3B8]">
+          <div className="flex flex-wrap gap-x-4 gap-y-2 text-sm text-[#94A3B8]">
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={createForm.discover_youtube} onChange={(e) => setCreateForm((p) => ({ ...p, discover_youtube: e.target.checked }))} />
-              Discovery YouTube
+              YouTube
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={createForm.discover_tiktok} onChange={(e) => setCreateForm((p) => ({ ...p, discover_tiktok: e.target.checked }))} />
+              TikTok
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={createForm.discover_instagram} onChange={(e) => setCreateForm((p) => ({ ...p, discover_instagram: e.target.checked }))} />
+              Instagram
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={createForm.discover_facebook} onChange={(e) => setCreateForm((p) => ({ ...p, discover_facebook: e.target.checked }))} />
+              Facebook
             </label>
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={createForm.dry_run} onChange={(e) => setCreateForm((p) => ({ ...p, dry_run: e.target.checked }))} />
@@ -380,14 +446,26 @@ export const AgentsCenter = () => {
                   <Input value={configForm.function_type} onChange={(e) => setConfigForm((p) => ({ ...p, function_type: e.target.value }))} />
                 </div>
               </div>
-              <div className="flex gap-4 text-sm text-[#94A3B8]">
+              <div className="flex flex-wrap gap-x-4 gap-y-2 text-sm text-[#94A3B8]">
                 <label className="flex items-center gap-2">
                   <input type="checkbox" checked={configForm.enabled} onChange={(e) => setConfigForm((p) => ({ ...p, enabled: e.target.checked }))} />
                   Agent actif
                 </label>
                 <label className="flex items-center gap-2">
                   <input type="checkbox" checked={configForm.discover_youtube} onChange={(e) => setConfigForm((p) => ({ ...p, discover_youtube: e.target.checked }))} />
-                  Discovery YouTube
+                  YouTube
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={configForm.discover_tiktok} onChange={(e) => setConfigForm((p) => ({ ...p, discover_tiktok: e.target.checked }))} />
+                  TikTok
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={configForm.discover_instagram} onChange={(e) => setConfigForm((p) => ({ ...p, discover_instagram: e.target.checked }))} />
+                  Instagram
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={configForm.discover_facebook} onChange={(e) => setConfigForm((p) => ({ ...p, discover_facebook: e.target.checked }))} />
+                  Facebook
                 </label>
                 <label className="flex items-center gap-2">
                   <input type="checkbox" checked={configForm.dry_run} onChange={(e) => setConfigForm((p) => ({ ...p, dry_run: e.target.checked }))} />
@@ -433,6 +511,12 @@ export const AgentsCenter = () => {
               <strong className="text-[#CBD5E1]">30–90 segonn</strong>, pa egzanp si TikTok chaje. YouTube ak Apify kounye a
               kouri <strong className="text-[#CBD5E1]">an paralèl</strong>. Redwi kantite a (egz. 8) epi dechoche platfòm ki pa
               nesesè pou pi vit.
+            </p>
+            <p className="text-xs text-[#64748B] mt-2 rounded-md bg-white/[0.04] px-3 py-2 border border-white/[0.06]">
+              <strong className="text-[#94A3B8]">Localhost:</strong> navigatè a pale ak backend ou a; se{" "}
+              <strong className="text-[#CBD5E1]">sèvè a</strong> ki rele Apify / YouTube. Localhost pa anpeche jwenn pwofil. Si
+              ou wè <strong className="text-[#CBD5E1]">0</strong>, souvan se: quota API, hashtags twò etwat, oswa twòp platfòm
+              ansanm (nou deduplike pa non itilizatè) — eseye hashtags ou menm, ogmante kantite a, oswa mwens platfòm.
             </p>
           </div>
 
@@ -495,6 +579,77 @@ export const AgentsCenter = () => {
                 </label>
               ))}
             </div>
+          </div>
+
+          <div className="space-y-2">
+            <Label className="text-[#94A3B8]">Hashtags (opsyonèl, Apify + YouTube)</Label>
+            <p className="text-xs text-[#64748B]">
+              Antre youn oswa plizyè (vègile, espas oswa virgul). Yo aplike sou TikTok, Instagram, Facebook; YouTube ajoute
+              requètes dapre menm mo yo. Si ou kite vid, backend itilize hashtags kategori a.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Input
+                type="text"
+                placeholder="egzanp: edikasyon, ayiti, kreyol"
+                value={hashtagInput}
+                onChange={(e) => setHashtagInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    addHashtagsFromInput();
+                  }
+                }}
+                className="flex-1 min-w-[200px] bg-[#050505] border-white/[0.08]"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                onClick={addHashtagsFromInput}
+                className="border-white/[0.12] text-white hover:bg-white/[0.06]"
+              >
+                Ajoute
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={applyCategoryHashtagSuggestions}
+                className="border-white/[0.12] text-white hover:bg-white/[0.06]"
+              >
+                Sijesyon kategori
+              </Button>
+              {searchHashtags.length ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setSearchHashtags([])}
+                  className="border-white/[0.12] text-[#94A3B8] hover:bg-white/[0.06]"
+                >
+                  Efase tout
+                </Button>
+              ) : null}
+            </div>
+            {searchHashtags.length ? (
+              <div className="flex flex-wrap gap-2">
+                {searchHashtags.map((tag, idx) => (
+                  <span
+                    key={`${tag}-${idx}`}
+                    className="inline-flex items-center gap-1 rounded-full bg-white/[0.08] px-2 py-0.5 text-xs text-[#E2E8F0]"
+                  >
+                    #{tag}
+                    <button
+                      type="button"
+                      className="text-[#94A3B8] hover:text-white ml-0.5"
+                      aria-label={`Retire ${tag}`}
+                      onClick={() => setSearchHashtags((prev) => prev.filter((_, i) => i !== idx))}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-[#64748B]">Oken hashtag personèl — default kategori ap itilize.</p>
+            )}
           </div>
 
           <div className="flex flex-wrap gap-2">
