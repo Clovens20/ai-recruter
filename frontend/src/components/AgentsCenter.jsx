@@ -1,12 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
+import { flushSync } from "react-dom";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
-import api, {
-  searchProfiles,
-  analyzeProfiles,
-  getAgentStatus,
-} from "../lib/api";
+import api, { searchProfiles, analyzeProfiles, getAgentStatus } from "../lib/api";
 import { useSearchParams } from "react-router-dom";
 
 const VIEWS = ["work", "config", "create", "results", "search"];
@@ -17,6 +14,20 @@ const PLATFORM_OPTIONS = [
   { id: "instagram", label: "Instagram" },
   { id: "facebook", label: "Facebook" },
 ];
+
+/** Ansyen pwofil dev / fallback — pa montre nan UI. */
+const PLACEHOLDER_PROFILE_USERNAMES = new Set(["test_ayisyen_biznis", "test_pipeline_ok"]);
+
+function filterRealAgentProfiles(profiles) {
+  if (!Array.isArray(profiles)) return [];
+  return profiles.filter((p) => {
+    const u = String(p?.username || "").trim().toLowerCase();
+    if (!u || PLACEHOLDER_PROFILE_USERNAMES.has(u)) return false;
+    const url = String(p?.profile_url || "").trim().toLowerCase().replace(/\/+$/, "");
+    if (url.endsWith("/@test") || url.endsWith("tiktok.com/@test")) return false;
+    return true;
+  });
+}
 
 const FALLBACK_CATEGORIES = [
   "Teknoloji",
@@ -58,6 +69,14 @@ export const AgentsCenter = () => {
   const [loading, setLoading] = useState(false);
 
   const formatApiError = (err) => {
+    const st = err?.response?.status;
+    if (st === 504) {
+      return (
+        "504 Gateway Timeout: proxy dev oswa backend pa fin reponn an tan. " +
+        "Verifye uvicorn sou pò a (souvan 8000), oswa rechèch Apify ki twò long; " +
+        "gade REACT_APP_DEV_PROXY_TIMEOUT_MS nan .env.local si bezwen."
+      );
+    }
     const d = err?.response?.data?.detail;
     if (d == null) return err?.message || "Erè rezo.";
     if (typeof d === "string") return d;
@@ -83,6 +102,7 @@ export const AgentsCenter = () => {
   const [hashtagInput, setHashtagInput] = useState("");
   const [searchHashtags, setSearchHashtags] = useState([]);
   const [discoveredProfiles, setDiscoveredProfiles] = useState([]);
+  const [searchHints, setSearchHints] = useState([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const [analyzeBusy, setAnalyzeBusy] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
@@ -194,16 +214,33 @@ export const AgentsCenter = () => {
       window.alert("Chwazi omwen yon platfòm.");
       return;
     }
+    setDiscoveredProfiles([]);
+    setSearchHints([]);
     setSearchBusy(true);
     try {
       const data = await searchProfiles(
         searchCategory,
         plats,
         maxSearchResults,
-        searchHashtags.length ? searchHashtags : undefined
+        searchHashtags.length ? searchHashtags : undefined,
+        {}
       );
-      setDiscoveredProfiles(data.profiles || []);
-      window.alert(`Jwenn ${data.count ?? 0} pwofil.`);
+      const profiles = filterRealAgentProfiles(data?.profiles);
+      const hints =
+        profiles.length === 0 && Array.isArray(data?.search_hints) ? data.search_hints : [];
+      // window.alert bloke fil la anvan React fin rann; san flushSync, UI ka rete sou 0 pandan alèt la.
+      flushSync(() => {
+        setDiscoveredProfiles(profiles);
+        setSearchHints(hints);
+        setSearchBusy(false);
+      });
+      if (!data || typeof data !== "object") {
+        window.alert("Repons API envalid (verifye proxy / URL backend).");
+      } else if (!Array.isArray(data.profiles)) {
+        window.alert("Repons san tablo profiles (verifye URL backend / JSON).");
+      } else {
+        window.alert(`Jwenn ${profiles.length} pwofil.`);
+      }
     } catch (err) {
       window.alert(formatApiError(err));
     } finally {
@@ -219,7 +256,11 @@ export const AgentsCenter = () => {
     setAnalyzeBusy(true);
     try {
       const data = await analyzeProfiles(discoveredProfiles);
-      setDiscoveredProfiles(data.profiles || []);
+      const next = data.profiles || [];
+      flushSync(() => {
+        setDiscoveredProfiles(next);
+        setAnalyzeBusy(false);
+      });
       window.alert(`${data.count ?? 0} pwofil kenbe (kreyòl > 70). Yo anrejistre kòm lead si Supabase OK.`);
     } catch (err) {
       window.alert(formatApiError(err));
@@ -518,6 +559,14 @@ export const AgentsCenter = () => {
               ou wè <strong className="text-[#CBD5E1]">0</strong>, souvan se: quota API, hashtags twò etwat, oswa twòp platfòm
               ansanm (nou deduplike pa non itilizatè) — eseye hashtags ou menm, ogmante kantite a, oswa mwens platfòm.
             </p>
+            <p className="text-xs text-amber-200/90 mt-2 rounded-md bg-amber-500/10 px-3 py-2 border border-amber-500/20">
+              <strong>Dev / Koyeb:</strong> si <code className="text-amber-100/90">REACT_APP_API_URL</code> nan{" "}
+              <code className="text-amber-100/90">.env.local</code> mennen dirèkteman sou Koyeb, se sèlman kod ki deja
+              deplwaye la ki kouri. Pou dev lokal: kite URL la <strong>vid</strong> +{" "}
+              <code className="text-amber-100/90">setupProxy</code> (default <code className="text-amber-100/90">127.0.0.1:8000</code>), oswa
+              mete <code className="text-amber-100/90">REACT_APP_DEV_USE_LOCAL_PROXY=true</code> pou fòse <code className="text-amber-100/90">/api</code>{" "}
+              nan dev menm si URL Koyeb la toujou nan fichye a.
+            </p>
           </div>
 
           {agentApiStatus ? (
@@ -676,6 +725,16 @@ export const AgentsCenter = () => {
             <p className="text-xs font-semibold uppercase tracking-wide text-[#94A3B8]">
               Pwofil jwenn ({discoveredProfiles.length})
             </p>
+            {searchHints.length > 0 ? (
+              <div className="text-xs text-amber-100/95 rounded-md bg-amber-500/10 border border-amber-500/25 px-3 py-2 space-y-1.5">
+                <p className="font-semibold text-amber-200">Diagnostic (0 profil)</p>
+                <ul className="list-disc pl-4 text-[#E7E5E4] space-y-1">
+                  {searchHints.map((h, idx) => (
+                    <li key={idx}>{h}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             <div className="max-h-[360px] overflow-y-auto space-y-2 rounded-lg border border-white/[0.06] p-2">
               {discoveredProfiles.length === 0 ? (
                 <p className="text-sm text-[#64748B] p-2">Poko gen rezilta.</p>

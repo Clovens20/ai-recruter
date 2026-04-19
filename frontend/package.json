@@ -62,7 +62,6 @@
     "build": "craco build",
     "test": "craco test"
   },
-  "proxy": "https://magnetic-marianne-konektegroupproject-a9cd18b2.koyeb.app",
   "browserslist": {
     "production": [
       ">0.2%",
@@ -76,6 +75,7 @@
     ]
   },
   "devDependencies": {
+    "http-proxy-middleware": "^2.0.9",
     "@babel/plugin-proposal-private-property-in-object": "^7.21.11",
     "@craco/craco": "^7.1.0",
     "@eslint/js": "9.23.0",

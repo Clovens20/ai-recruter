@@ -2,6 +2,13 @@ import axios from "axios";
 
 /** Base du backend sans /api final (ex. https://xxx.koyeb.app). CRA: REACT_APP_API_URL dans frontend/.env */
 function apiBaseURL() {
+  const dev = process.env.NODE_ENV === "development";
+  const forceProxy =
+    dev &&
+    ["1", "true", "yes"].includes(
+      String(process.env.REACT_APP_DEV_USE_LOCAL_PROXY || "").toLowerCase()
+    );
+  if (forceProxy) return "/api";
   const u = (process.env.REACT_APP_API_URL || "").trim();
   if (!u) return "/api";
   const clean = u.replace(/\/+$/, "");
@@ -36,8 +43,8 @@ api.interceptors.response.use(
 export const fetchPublicHealth = () => api.get("/health").then((r) => r.data);
 export const fetchSupabaseHealth = () => api.get("/health/supabase").then((r) => r.data);
 
-export const searchProfiles = (category, platforms, maxResults = 20, hashtags) => {
-  const body = { category, platforms, max_results: maxResults };
+export const searchProfiles = (category, platforms, maxResults = 20, hashtags, extra = {}) => {
+  const body = { category, platforms, max_results: maxResults, ...extra };
   if (Array.isArray(hashtags) && hashtags.length) body.hashtags = hashtags;
   return api.post("/agent/search", body).then((r) => r.data);
 };

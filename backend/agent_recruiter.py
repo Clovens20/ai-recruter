@@ -278,6 +278,15 @@ def _tiktok_parse_author(item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
         or uid
     )
     if not uid and not nick:
+        for url_key in ("authorUrl", "authorProfileUrl", "authorLink", "webVideoUrl"):
+            raw = (item.get(url_key) or "").strip()
+            if not raw:
+                continue
+            m = re.search(r"tiktok\.com/@([^/?#\s]+)", raw, re.I)
+            if m:
+                uid = m.group(1).strip()
+                break
+    if not uid and not nick:
         return None
     display = nick or uid
     url_id = uid or nick
@@ -334,7 +343,7 @@ async def discover_tiktok_profiles(
         APIFY_TIKTOK_RESULTS_PER_PAGE,
         max(20, min(APIFY_TIKTOK_RESULTS_CAP, max_results * 3, 80)),
     )
-    # Champs souvan rekòmande pa clockworks/tiktok-scraper (proxyCountryCode, excludePinnedPosts)
+    # Champs clockworks/tiktok-scraper — pa voye proxyCountryCode si pa defini (string "None" kase run Apify).
     run_input_base: Dict[str, Any] = {
         "hashtags": hashtags_primary,
         "resultsPerPage": results_per_page,
@@ -343,18 +352,19 @@ async def discover_tiktok_profiles(
         "shouldDownloadAvatars": False,
         "excludePinnedPosts": False,
         "scrapeRelatedVideos": False,
-        "proxyCountryCode": os.environ.get("APIFY_TIKTOK_PROXY_COUNTRY", "None"),
     }
+    _pc = (os.environ.get("APIFY_TIKTOK_PROXY_COUNTRY") or "").strip()
+    if _pc and _pc.lower() not in ("none", "null", "false", "0", ""):
+        run_input_base["proxyCountryCode"] = _pc
 
-    print(
-        f"[tiktok] actor={APIFY_TIKTOK_ACTOR} hashtags={hashtags_primary!r} resultsPerPage={results_per_page}",
-        flush=True,
-    )
+    hashtags = hashtags_primary
+    print(f"[tiktok] APIFY_TOKEN present: {bool(APIFY_TOKEN)}", flush=True)
+    print(f"[tiktok] hashtags: {hashtags}", flush=True)
     items = await apify_run(
         APIFY_TIKTOK_ACTOR,
         run_input_base,
     )
-    print(f"[tiktok] items_brut={len(items or [])}", flush=True)
+    print(f"[tiktok] run result items count: {len(items)}", flush=True)
     if not items:
         logger.warning(
             "TikTok Apify retounen 0 atik (hashtags=%s). Tcheke kle Apify ak actor %s.",
@@ -362,7 +372,13 @@ async def discover_tiktok_profiles(
             APIFY_TIKTOK_ACTOR,
         )
     profiles = _tiktok_items_to_profiles(items, max_results)
-    print(f"[tiktok] profiles_parse={len(profiles)}", flush=True)
+    if items and not profiles:
+        sample = items[0] if isinstance(items[0], dict) else {}
+        logger.warning(
+            "TikTok: %s atik Apify men 0 pwofil apre parsing — kle echantiyon: %s",
+            len(items),
+            list(sample.keys())[:25],
+        )
 
     primary_set = frozenset(h.lower() for h in hashtags_primary)
     fallback_set = frozenset(h.lower() for h in TIKTOK_FALLBACK_HASHTAGS)
@@ -594,11 +610,11 @@ async def discover_youtube_agent_search_async(
     category: str, max_results: int, extra_hashtags: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """YouTube pou POST /api/agent/search — requètes kreyòl / Ayiti an paralèl."""
+    print(f"[youtube] API_KEY present: {bool(YOUTUBE_API_KEY)}", flush=True)
     if not YOUTUBE_API_KEY:
-        print("[youtube/search] YOUTUBE_API_KEY manke", flush=True)
         return []
     queries = list(youtube_agent_search_queries(category))
-    print(f"[youtube/search] queries={queries[:6]!r}... (total {len(queries)})", flush=True)
+    print(f"[youtube] queries: {queries}", flush=True)
     if extra_hashtags:
         seen_q = {q.lower() for q in queries}
         for h in normalize_custom_hashtags(extra_hashtags, max_tags=8)[:5]:
@@ -618,7 +634,8 @@ async def discover_youtube_agent_search_async(
         discovered.extend(p or [])
     deduped = _dedupe_youtube_channels(discovered)
     deduped.sort(key=lambda x: int(x.get("followers") or 0), reverse=True)
-    print(f"[youtube/search] queries={len(queries)} kanaal={len(deduped)}", flush=True)
+    channels = deduped
+    print(f"[youtube] total channels found: {len(channels)}", flush=True)
     return deduped[:max_results]
 
 

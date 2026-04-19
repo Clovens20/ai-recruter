@@ -655,6 +655,8 @@ class AgentSearchRequest(BaseModel):
 class AgentSearchResponse(BaseModel):
     profiles: List[AgentProfilePayload]
     count: int
+    # Si count=0 : pistes diagnostic (kle API, quota, etc.) — pa gen done sanspib
+    search_hints: Optional[List[str]] = None
 
 
 class AgentAnalyzeRequest(BaseModel):
@@ -1820,17 +1822,23 @@ async def agent_status(current_user: str = Depends(require_auth)):
     )
 
 
-def _agent_search_diag(msg: str) -> None:
-    """Logs visib sou Koyeb / stdout (print) + logger."""
-    line = f"[agent/search] {msg}"
-    print(line, flush=True)
-    logger.info("%s", line)
+_PLACEHOLDER_AGENT_USERNAMES = frozenset({"test_ayisyen_biznis", "test_pipeline_ok"})
+
+
+def _agent_raw_row_is_placeholder(row: Dict[str, Any]) -> bool:
+    """Retire ansyen pwofil dev / fallback — sèlman kandida reyèl."""
+    u = (row.get("username") or "").strip().lower()
+    if u in _PLACEHOLDER_AGENT_USERNAMES:
+        return True
+    url = (row.get("profile_url") or "").strip().lower().rstrip("/")
+    if url.endswith("/@test") or url.endswith("tiktok.com/@test"):
+        return True
+    return False
 
 
 @api_router.post("/agent/search", response_model=AgentSearchResponse)
 async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(require_auth)):
     """Dekouvèt pwofil sou TikTok, YouTube, Facebook, Instagram selon kategori ak hashtags kreyòl."""
-    _agent_search_diag(f"debut user={current_user!r} category={payload.category!r} platforms={payload.platforms!r}")
     cat = agent_rc.normalize_category(payload.category)
     max_r = max(1, min(100, int(payload.max_results or 20)))
     plats = [p.lower().strip() for p in (payload.platforms or []) if p.strip()]
@@ -1845,10 +1853,6 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
 
     # Plis kandida pa sous anvan dedup username (anpil platfòm = mwens pa youn)
     per = max(8, max(1, max_r // max(1, len(plats))))
-    _agent_search_diag(
-        f"cle: YOUTUBE={'oui' if bool(YOUTUBE_API_KEY) else 'non'} APIFY={'oui' if bool(os.environ.get('APIFY_API_KEY', '')) else 'non'} "
-        f"actor_tiktok={agent_rc.APIFY_TIKTOK_ACTOR!r} category_norm={cat!r} max_results={max_r} per_plat={per} hashtags_custom={bool(custom_ht)}"
-    )
     raw_profiles: List[Dict[str, Any]] = []
 
     async def safe(coro):
@@ -1893,17 +1897,15 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
         tasks.append(safe(agent_rc.discover_facebook_profiles(cat, per, custom_ht)))
     if tasks:
         parts = await asyncio.gather(*tasks)
-        for i, part in enumerate(parts):
-            n = len(part or [])
-            _agent_search_diag(f"gather task#{i} retounen {n} pwofil (brut)")
+        for part in parts:
             raw_profiles.extend(part or [])
-
-    _agent_search_diag(f"total brut apre gather: {len(raw_profiles)}")
 
     # Dedupe pa username sèlman (tout platfòm), limite max_r
     seen: set = set()
     merged: List[Dict[str, Any]] = []
     for row in raw_profiles:
+        if _agent_raw_row_is_placeholder(row):
+            continue
         name_key = (row.get("username") or "").strip().lower()
         if not name_key:
             continue
@@ -1913,8 +1915,6 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
         merged.append(row)
         if len(merged) >= max_r:
             break
-
-    _agent_search_diag(f"apre dedup username: {len(merged)} (limite max_r={max_r})")
 
     out: List[AgentProfilePayload] = []
     for row in merged[:max_r]:
@@ -1939,8 +1939,28 @@ async def agent_search(payload: AgentSearchRequest, current_user: str = Depends(
             )
         )
 
-    _agent_search_diag(f"fin: count={len(out)} (pa filtre kreyòl — creole_score=0)")
-    return AgentSearchResponse(profiles=out, count=len(out))
+    hints: Optional[List[str]] = None
+    if len(out) == 0:
+        hints = []
+        apify_ok = bool(os.environ.get("APIFY_API_KEY", "").strip())
+        yt_ok = bool((YOUTUBE_API_KEY or "").strip())
+        if "tiktok" in plats and not apify_ok:
+            hints.append(
+                "TikTok : ajoutez APIFY_API_KEY dans backend/.env ou .env à la racine, puis redémarrez uvicorn."
+            )
+        if "youtube" in plats and not yt_ok:
+            hints.append(
+                "YouTube : ajoutez YOUTUBE_API_KEY (projet Google Cloud avec API YouTube Data v3 activée)."
+            )
+        if ("instagram" in plats or "facebook" in plats) and not apify_ok:
+            hints.append("Instagram / Facebook : la même variable APIFY_API_KEY est requise (acteurs Apify).")
+        if not hints:
+            hints.append(
+                "Clés détectées mais 0 profil : quotas ou limites Apify, hashtags trop étroits, "
+                "ou format de données TikTok — regardez la console uvicorn (lignes [apify], [tiktok], [youtube]). "
+                "Testez d’abord une seule plateforme (ex. YouTube seul) avec une catégorie large."
+            )
+    return AgentSearchResponse(profiles=out, count=len(out), search_hints=hints)
 
 
 @api_router.post("/agent/analyze", response_model=AgentAnalyzeResponse)
